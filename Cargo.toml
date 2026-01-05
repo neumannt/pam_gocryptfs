@@ -1,0 +1,19 @@
+[package]
+name = "pam_gocryptfs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "PAM module that mounts gocryptfs on session open and unmounts on session close."
+build = "build.rs"
+
+[lib]
+name = "pam_gocryptfs"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
