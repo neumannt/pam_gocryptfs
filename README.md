@@ -62,11 +62,19 @@ You can enable the module system-wide for all sessions or per-service.
 ```bash
 sudoedit /etc/pam.d/common-session
 # Add near the end:
-# session optional pam_gocryptfs.so
+session optional pam_gocryptfs.so
 
 sudoedit /etc/pam.d/common-session-noninteractive
 # Add near the end:
-# session optional pam_gocryptfs.so
+session optional pam_gocryptfs.so
+
+sudoedit /etc/pam.d/common-password
+# Add near the end:
+password optional pam_gocryptfs.so
+
+sudoedit /etc/pam.d/common-auth
+# Add near the end:
+auth required pam_gocryptfs.so
 ```
 
 Notes:
@@ -124,9 +132,11 @@ You may also see messages attached to the calling service (e.g., `login`, `sshd`
 # Remove PAM configuration lines you added
 sudoedit /etc/pam.d/common-session
 sudoedit /etc/pam.d/common-session-noninteractive
+sudoedit /etc/pam.d/common-password
+sudoedit /etc/pam.d/common-auth
 
 # Remove the module
-PAM_SEC_DIR="$(dpkg -L libpam-modules | awk '/\/security$/ {print; exit}')"
+PAM_SEC_DIR="$(dpkg -L libpam-modules | awk '/\/security\/.*\.so$/ {print; exit}' | xargs dirname)"
 sudo rm -f "$PAM_SEC_DIR/pam_gocryptfs.so"
 ```
 
