@@ -37,8 +37,11 @@ use std::ptr::{null, null_mut};
 
 // PAM constants
 const PAM_SUCCESS: c_int = 0;
-const PAM_AUTHTOK: c_int = 27;
+const PAM_AUTHTOK_RECOVERY_ERR: c_int = 21;
+const PAM_AUTHTOK: c_int = 6;
+const PAM_OLDAUTHTOK: c_int = 7;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
+const PAM_PRELIM_CHECK: c_int = 0x4000;
 
 // Defaults
 const DEFAULT_CIPHER_DIR_NAME: &str = ".gocryptfs";
@@ -533,8 +536,179 @@ pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_chauthtok(_pamh: *mut pam_handle_t, _flags: c_int, _argc: c_int, _argv: *const *const c_char) -> c_int {
-    // No-op: gocryptfs password changes are interactive (`gocryptfs -passwd`).
-    // Integrating here would require orchestrating multiple prompts and is out of scope.
+pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
+    // Fetch user
+    let pwd = fetch_pwd(pamh);
+    if pwd.is_null() {
+        return PAM_SUCCESS;
+    }
+
+    // Get old password
+    let mut item: *const c_void = null();
+    let rc_old = pam_get_item(pamh as *const pam_handle_t, PAM_OLDAUTHTOK, &mut item);
+    if rc_old != PAM_SUCCESS {
+        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving old passphrase; rc = [%d]\n\0").as_ptr(), rc_old);
+        return PAM_SUCCESS;
+    }
+    let old_pass_ptr = item as *const c_char;
+
+    // On PRELIM_CHECK, only verify we have the old password
+    if (flags & PAM_PRELIM_CHECK) != 0 {
+        if old_pass_ptr.is_null() || CStr::from_ptr(old_pass_ptr).to_bytes().is_empty() {
+            syslog_warn("pam_gocryptfs: PRELIM_CHECK: old password is missing");
+            return PAM_AUTHTOK_RECOVERY_ERR;
+        }
+        return PAM_SUCCESS;
+    }
+
+    // Get new password
+    item = null();
+    let rc_new = pam_get_item(pamh as *const pam_handle_t, PAM_AUTHTOK, &mut item);
+    if rc_new != PAM_SUCCESS {
+        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving new passphrase; rc = [%d]\n\0").as_ptr(), rc_new);
+        return PAM_SUCCESS;
+    }
+    let new_pass_ptr = item as *const c_char;
+
+    if old_pass_ptr.is_null() || new_pass_ptr.is_null() || CStr::from_ptr(new_pass_ptr).to_bytes().is_empty() {
+        syslog_warn("pam_gocryptfs: at least one passphrase is NULL/empty; skipping password change");
+        return PAM_AUTHTOK_RECOVERY_ERR;
+    }
+
+    // Determine cipherdir (ignore mountpoint here)
+    let (cipher_arg, _mount_arg) = parse_pam_args(argc, argv);
+    let home = CStr::from_ptr((*pwd).pw_dir);
+    let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(home, cipher_arg.as_deref(), None);
+
+    // Ensure cipherdir has gocryptfs.conf
+    let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
+    if !file_exists(&conf_path) {
+        syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping password change");
+        return PAM_SUCCESS;
+    }
+
+    // Prepare pipe for old password via -passfile (write done by helper)
+    let old_c = CStr::from_ptr(old_pass_ptr);
+    let (old_rd, old_wr) = match create_pass_pipe_with_data(old_c.to_bytes()) {
+        Some(fds) => fds,
+        None => {
+            syslog_err("pam_gocryptfs: Failed to create old-pass pipe");
+            return PAM_SUCCESS;
+        }
+    };
+
+    // Prepare stdin pipe for new password (we will write it twice with newlines)
+    let mut stdin_fds = [0i32; 2];
+    let have_pipe2 = pipe2(stdin_fds.as_mut_ptr(), libc::O_CLOEXEC) == 0;
+    if !have_pipe2 && pipe(stdin_fds.as_mut_ptr()) != 0 {
+        close(old_rd);
+        close(old_wr);
+        syslog_err("pam_gocryptfs: Failed to create stdin pipe");
+        return PAM_SUCCESS;
+    }
+    let stdin_rd = stdin_fds[0];
+    let stdin_wr = stdin_fds[1];
+
+    // Drop privileges to the user for the exec
+    let oeuid = geteuid();
+    let oegid = getegid();
+    let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
+    let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
+    let mut groups: Vec<gid_t> = vec![0; max_groups];
+    let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
+
+    let restore_privs = || {
+        let _ = seteuid(oeuid);
+        let _ = setegid(oegid);
+        if ngids > 0 {
+            let _ = setgroups(ngids, groups.as_ptr());
+        }
+    };
+
+    if setegid((*pwd).pw_gid) < 0 || setgroups(1, &(*pwd).pw_gid as *const gid_t) < 0 || seteuid((*pwd).pw_uid) < 0 {
+        syslog_err("pam_gocryptfs: failed to drop privileges for password change");
+        close(old_rd);
+        close(old_wr);
+        close(stdin_rd);
+        close(stdin_wr);
+        restore_privs();
+        return PAM_SUCCESS;
+    }
+
+    // Fork and exec: gocryptfs -passwd -passfile /proc/self/fd/<old_rd> <cipherdir>
+    // The new password is provided twice via child's stdin.
+    let pid = fork();
+    if pid < 0 {
+        syslog_err("pam_gocryptfs: fork() failed for password change");
+        close(old_rd);
+        close(old_wr);
+        close(stdin_rd);
+        close(stdin_wr);
+        restore_privs();
+        return PAM_SUCCESS;
+    }
+
+    if pid == 0 {
+        // Child
+        clearenv();
+
+        // Ensure we fully run as the user (ruid/euid/suid)
+        if setresuid((*pwd).pw_uid, (*pwd).pw_uid, (*pwd).pw_uid) < 0 {
+            libc::_exit(1);
+        }
+
+        // Close write ends in child; we will only read
+        close(old_wr);
+        close(stdin_wr);
+
+        // Connect stdin pipe read end to STDIN
+        if libc::dup2(stdin_rd, 0) < 0 {
+            libc::_exit(1);
+        }
+        close(stdin_rd);
+
+        // Build -passfile /proc/self/fd/<old_rd>
+        let passfile_arg = CString::new(format!("/proc/self/fd/{}", old_rd)).unwrap();
+
+        let bin = cstr(DEFAULT_GCRYPTFS_BIN);
+        let arg0 = cstr("gocryptfs\0");
+        let a_q = cstr("-q\0");
+        let a_nosyslog = cstr("-nosyslog\0");
+        let a_passwd = cstr("-passwd\0");
+        let a_passfile = cstr("-passfile\0");
+
+        execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), a_passfile.as_ptr(), passfile_arg.as_ptr(), cipherdir.as_ptr(), null::<c_char>());
+        // If we get here, exec failed
+        libc::_exit(1);
+    }
+
+    // Parent: we no longer need read ends
+    close(old_rd);
+    close(stdin_rd);
+
+    // Parent: write new password twice + newline to child's stdin, then close
+    let new_c = CStr::from_ptr(new_pass_ptr);
+    let mut buf = Vec::with_capacity(new_c.to_bytes().len() * 2 + 2);
+    buf.extend_from_slice(new_c.to_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(new_c.to_bytes());
+    buf.push(b'\n');
+
+    let wrote = write(stdin_wr, buf.as_ptr() as *const c_void, buf.len());
+    if wrote < 0 || wrote as usize != buf.len() {
+        syslog_err("pam_gocryptfs: Failed to write new password to stdin");
+    }
+    close(stdin_wr);
+
+    // Close the old password writer (it was pre-filled by helper)
+    close(old_wr);
+
+    // Wait for child to finish
+    let mut _st: c_int = 0;
+    let _ = waitpid(pid, &mut _st, 0);
+
+    // Restore privileges
+    restore_privs();
+
     PAM_SUCCESS
 }
