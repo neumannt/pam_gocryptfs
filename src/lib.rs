@@ -259,8 +259,8 @@ fn build_default_paths(pwd: *mut passwd, cipher_arg: Option<&str>, mount_arg: Op
     let home_str = home.to_string_lossy();
     let cipherdir = cipher_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
     let mountpoint = mount_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
-    let auto_mount = format!("{}/{}", cipherdir, AUTO_MOUNT_FILE);
-    let auto_umount = format!("{}/{}", cipherdir, AUTO_UMOUNT_FILE);
+    let auto_mount = format!("{}.{}", cipherdir, AUTO_MOUNT_FILE);
+    let auto_umount = format!("{}.{}", cipherdir, AUTO_UMOUNT_FILE);
     (CString::new(cipherdir).unwrap(), CString::new(mountpoint).unwrap(), CString::new(auto_mount).unwrap(), CString::new(auto_umount).unwrap())
 }
 

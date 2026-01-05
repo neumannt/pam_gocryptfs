@@ -5,7 +5,7 @@ This was inspired by pam_ecryptfs, with a first version drafted by GPT5.
 
 - Default cipher directory: `~/.gocryptfs`
 - Default mount point: `~/Private`
-- Opt-in toggles: `~/.gocryptfs/auto-mount` and `~/.gocryptfs/auto-umount`
+- Opt-in toggles: `~/.gocryptfs.auto-mount` and `~/.gocryptfs.auto-umount`
 - Password is read from PAM’s `PAM_AUTHTOK` or prompted if missing, and passed to `gocryptfs` via a pipe using `-passfile /proc/self/fd/N`
 - Runs `gocryptfs`/`fusermount3` as the target user (drops privileges)
 
@@ -100,8 +100,8 @@ gocryptfs -init ~/.gocryptfs
 mkdir -m 700 -p ~/Private
 
 # Opt-in to auto mount/umount
-touch ~/.gocryptfs/auto-mount
-touch ~/.gocryptfs/auto-umount
+touch ~/.gocryptfs.auto-mount
+touch ~/.gocryptfs.auto-umount
 ```
 
 Now log out and log back in. On session open, the module will:
