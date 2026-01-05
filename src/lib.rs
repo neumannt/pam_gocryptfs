@@ -98,26 +98,32 @@ extern "C" {
     fn close(fd: c_int) -> c_int;
 }
 
-unsafe fn cstr(s: &str) -> CString {
+fn cstr(s: &str) -> CString {
     CString::new(s).unwrap()
 }
 
-unsafe fn syslog_err(msg: &str) {
+fn syslog_err(msg: &str) {
     let fmt = cstr("%s\0");
     let m = cstr(msg);
-    syslog(libc::LOG_ERR, fmt.as_ptr(), m.as_ptr());
+    unsafe {
+        syslog(libc::LOG_ERR, fmt.as_ptr(), m.as_ptr());
+    }
 }
 
-unsafe fn syslog_warn(msg: &str) {
+fn syslog_warn(msg: &str) {
     let fmt = cstr("%s\0");
     let m = cstr(msg);
-    syslog(libc::LOG_WARNING, fmt.as_ptr(), m.as_ptr());
+    unsafe {
+        syslog(libc::LOG_WARNING, fmt.as_ptr(), m.as_ptr());
+    }
 }
 
-unsafe fn syslog_debug(msg: &str) {
+fn syslog_debug(msg: &str) {
     let fmt = cstr("%s\0");
     let m = cstr(msg);
-    syslog(libc::LOG_DEBUG, fmt.as_ptr(), m.as_ptr());
+    unsafe {
+        syslog(libc::LOG_DEBUG, fmt.as_ptr(), m.as_ptr());
+    }
 }
 
 unsafe fn fetch_pwd(pamh: *mut pam_handle_t) -> *mut passwd {
@@ -134,9 +140,11 @@ unsafe fn fetch_pwd(pamh: *mut pam_handle_t) -> *mut passwd {
     pwd
 }
 
-unsafe fn file_exists(path: &CStr) -> bool {
-    let mut s: libc::stat = zeroed();
-    stat(path.as_ptr(), &mut s) == 0
+fn file_exists(path: &CStr) -> bool {
+    unsafe {
+        let mut s: libc::stat = zeroed();
+        stat(path.as_ptr(), &mut s) == 0
+    }
 }
 
 unsafe fn ensure_dir(path: &CStr, mode: mode_t) -> bool {
