@@ -40,7 +40,7 @@ On Debian/Ubuntu, PAM modules live under a multiarch-specific security directory
 
 ```bash
 # Discover the PAM module directory
-PAM_SEC_DIR="$(dpkg -L libpam-modules | awk '/\/security$/ {print; exit}')"
+PAM_SEC_DIR="$(dpkg -L libpam-modules | awk '/\/security\/.*\.so$/ {print; exit}' | xargs dirname)"
 echo "PAM module dir: $PAM_SEC_DIR"
 
 # Install (rename to pam_gocryptfs.so)
@@ -48,6 +48,7 @@ sudo install -m 0644 target/release/libpam_gocryptfs.so "$PAM_SEC_DIR/pam_gocryp
 ```
 
 If detection fails, typical locations include:
+
 - `/lib/x86_64-linux-gnu/security`
 - `/lib/aarch64-linux-gnu/security`
 - `/lib/security` (older/non-multiarch)
