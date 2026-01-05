@@ -670,22 +670,10 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
         return PAM_SUCCESS;
     }
 
-    // Prepare pipe for old password via -passfile (write done by helper)
-    let old_c = CStr::from_ptr(old_pass_ptr);
-    let (old_rd, old_wr) = match create_pass_pipe_with_data(old_c.to_bytes()) {
-        Some(fds) => fds,
-        None => {
-            syslog_err("pam_gocryptfs: Failed to create old-pass pipe");
-            return PAM_SUCCESS;
-        }
-    };
-
-    // Prepare stdin pipe for new password (we will write it twice with newlines)
+    // Prepare stdin pipe for old and new password (we will write it twice with newlines)
     let mut stdin_fds = [0i32; 2];
     let have_pipe2 = pipe2(stdin_fds.as_mut_ptr(), libc::O_CLOEXEC) == 0;
     if !have_pipe2 && pipe(stdin_fds.as_mut_ptr()) != 0 {
-        close(old_rd);
-        close(old_wr);
         syslog_err("pam_gocryptfs: Failed to create stdin pipe");
         return PAM_SUCCESS;
     }
@@ -710,8 +698,6 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
 
     if setegid((*pwd).pw_gid) < 0 || setgroups(1, &(*pwd).pw_gid as *const gid_t) < 0 || seteuid((*pwd).pw_uid) < 0 {
         syslog_err("pam_gocryptfs: failed to drop privileges for password change");
-        close(old_rd);
-        close(old_wr);
         close(stdin_rd);
         close(stdin_wr);
         restore_privs();
@@ -723,8 +709,6 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
     let pid = fork();
     if pid < 0 {
         syslog_err("pam_gocryptfs: fork() failed for password change");
-        close(old_rd);
-        close(old_wr);
         close(stdin_rd);
         close(stdin_wr);
         restore_privs();
@@ -741,7 +725,6 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
         }
 
         // Close write ends in child; we will only read
-        close(old_wr);
         close(stdin_wr);
 
         // Connect stdin pipe read end to STDIN
@@ -750,28 +733,26 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
         }
         close(stdin_rd);
 
-        // Build -passfile /proc/self/fd/<old_rd>
-        let passfile_arg = CString::new(format!("/proc/self/fd/{}", old_rd)).unwrap();
-
         let bin = cstr(DEFAULT_GCRYPTFS_BIN);
         let arg0 = cstr("gocryptfs");
         let a_q = cstr("-q");
         let a_nosyslog = cstr("-nosyslog");
         let a_passwd = cstr("-passwd");
-        let a_passfile = cstr("-passfile");
 
-        execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), a_passfile.as_ptr(), passfile_arg.as_ptr(), cipherdir.as_ptr(), null::<c_char>());
+        execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), cipherdir.as_ptr(), null::<c_char>());
         // If we get here, exec failed
         libc::_exit(1);
     }
 
     // Parent: we no longer need read ends
-    close(old_rd);
     close(stdin_rd);
 
-    // Parent: write new password twice + newline to child's stdin, then close
+    // Parent: write old password + new password twice + newline to child's stdin, then close
+    let old_c = CStr::from_ptr(old_pass_ptr);
     let new_c = CStr::from_ptr(new_pass_ptr);
-    let mut buf = Vec::with_capacity(new_c.to_bytes().len() * 2 + 2);
+    let mut buf = Vec::with_capacity(old_c.to_bytes().len() + new_c.to_bytes().len() * 2 + 3);
+    buf.extend_from_slice(old_c.to_bytes());
+    buf.push(b'\n');
     buf.extend_from_slice(new_c.to_bytes());
     buf.push(b'\n');
     buf.extend_from_slice(new_c.to_bytes());
@@ -782,9 +763,6 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
         syslog_err("pam_gocryptfs: Failed to write new password to stdin");
     }
     close(stdin_wr);
-
-    // Close the old password writer (it was pre-filled by helper)
-    close(old_wr);
 
     // Wait for child to finish
     let mut _st: c_int = 0;
