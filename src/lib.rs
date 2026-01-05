@@ -106,7 +106,7 @@ fn cstr(s: &str) -> CString {
 }
 
 fn syslog_err(msg: &str) {
-    let fmt = cstr("%s\0");
+    let fmt = cstr("%s");
     let m = cstr(msg);
     unsafe {
         syslog(libc::LOG_ERR, fmt.as_ptr(), m.as_ptr());
@@ -114,7 +114,7 @@ fn syslog_err(msg: &str) {
 }
 
 fn syslog_warn(msg: &str) {
-    let fmt = cstr("%s\0");
+    let fmt = cstr("%s");
     let m = cstr(msg);
     unsafe {
         syslog(libc::LOG_WARNING, fmt.as_ptr(), m.as_ptr());
@@ -122,7 +122,7 @@ fn syslog_warn(msg: &str) {
 }
 
 fn syslog_debug(msg: &str) {
-    let fmt = cstr("%s\0");
+    let fmt = cstr("%s");
     let m = cstr(msg);
     unsafe {
         syslog(libc::LOG_DEBUG, fmt.as_ptr(), m.as_ptr());
@@ -133,12 +133,12 @@ unsafe fn fetch_pwd(pamh: *mut pam_handle_t) -> *mut passwd {
     let mut username_ptr: *const c_char = null();
     let rc = pam_get_user(pamh, &mut username_ptr, null());
     if rc != PAM_SUCCESS || username_ptr.is_null() {
-        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error getting user; rc = [%d]\n\0").as_ptr(), rc);
+        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error getting user; rc = [%d]\n").as_ptr(), rc);
         return null_mut();
     }
     let pwd = getpwnam(username_ptr);
     if pwd.is_null() {
-        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n\0").as_ptr());
+        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n").as_ptr());
     }
     pwd
 }
@@ -266,7 +266,7 @@ unsafe fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<CString> {
     }
     // Fall back to prompting
     let mut resp: *mut c_char = null_mut();
-    let prompt = cstr("gocryptfs passphrase: \0");
+    let prompt = cstr("gocryptfs passphrase: ");
     let prc = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &mut resp, prompt.as_ptr());
     if prc == PAM_SUCCESS && !resp.is_null() {
         let out = CStr::from_ptr(resp).to_bytes();
@@ -378,10 +378,10 @@ unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, cipherdir: &CStr, mountpoint
 
             // Exec gocryptfs
             let bin = cstr(DEFAULT_GCRYPTFS_BIN);
-            let arg0 = cstr("gocryptfs\0");
-            let a1 = cstr("-q\0");
-            let a2 = cstr("-nosyslog\0");
-            let a3 = cstr("-passfile\0");
+            let arg0 = cstr("gocryptfs");
+            let a1 = cstr("-q");
+            let a2 = cstr("-nosyslog");
+            let a3 = cstr("-passfile");
 
             execl(bin.as_ptr(), arg0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), passfile_arg.as_ptr(), cipherdir.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
             // If execl returns, it failed
@@ -422,13 +422,13 @@ unsafe fn unmount_gocryptfs_as_user(pwd: *mut passwd, mountpoint: &CStr) {
                 libc::_exit(1);
             }
 
-            let fusermount3 = cstr("/bin/fusermount3\0");
-            let fusermount = cstr("/bin/fusermount\0");
-            let umount_bin = cstr("/bin/umount\0");
-            let arg0_fm3 = cstr("fusermount3\0");
-            let arg0_fm = cstr("fusermount\0");
-            let arg0_um = cstr("umount\0");
-            let arg_u = cstr("-u\0");
+            let fusermount3 = cstr("/bin/fusermount3");
+            let fusermount = cstr("/bin/fusermount");
+            let umount_bin = cstr("/bin/umount");
+            let arg0_fm3 = cstr("fusermount3");
+            let arg0_fm = cstr("fusermount");
+            let arg0_um = cstr("umount");
+            let arg_u = cstr("-u");
 
             // Try fusermount3
             execl(fusermount3.as_ptr(), arg0_fm3.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
@@ -592,7 +592,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
     let mut item: *const c_void = null();
     let rc_old = pam_get_item(pamh as *const pam_handle_t, PAM_OLDAUTHTOK, &mut item);
     if rc_old != PAM_SUCCESS {
-        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving old passphrase; rc = [%d]\n\0").as_ptr(), rc_old);
+        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving old passphrase; rc = [%d]\n").as_ptr(), rc_old);
         return PAM_SUCCESS;
     }
     let old_pass_ptr = item as *const c_char;
@@ -610,7 +610,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
     item = null();
     let rc_new = pam_get_item(pamh as *const pam_handle_t, PAM_AUTHTOK, &mut item);
     if rc_new != PAM_SUCCESS {
-        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving new passphrase; rc = [%d]\n\0").as_ptr(), rc_new);
+        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving new passphrase; rc = [%d]\n").as_ptr(), rc_new);
         return PAM_SUCCESS;
     }
     let new_pass_ptr = item as *const c_char;
@@ -715,11 +715,11 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
         let passfile_arg = CString::new(format!("/proc/self/fd/{}", old_rd)).unwrap();
 
         let bin = cstr(DEFAULT_GCRYPTFS_BIN);
-        let arg0 = cstr("gocryptfs\0");
-        let a_q = cstr("-q\0");
-        let a_nosyslog = cstr("-nosyslog\0");
-        let a_passwd = cstr("-passwd\0");
-        let a_passfile = cstr("-passfile\0");
+        let arg0 = cstr("gocryptfs");
+        let a_q = cstr("-q");
+        let a_nosyslog = cstr("-nosyslog");
+        let a_passwd = cstr("-passwd");
+        let a_passfile = cstr("-passfile");
 
         execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), a_passfile.as_ptr(), passfile_arg.as_ptr(), cipherdir.as_ptr(), null::<c_char>());
         // If we get here, exec failed
