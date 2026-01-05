@@ -28,13 +28,11 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(dead_code)]
 
-use libc::{c_char, c_int, c_long, c_uint, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_WRONLY, S_IFDIR};
+use libc::{c_char, c_int, c_long, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, S_IFDIR};
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::Write;
-use std::mem::{size_of, zeroed};
+use std::mem::zeroed;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 
 // PAM constants
