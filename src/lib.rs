@@ -26,7 +26,7 @@
 
 #![allow(non_camel_case_types)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
-#![allow(dead_code)]
+#![allow(clippy::missing_safety_doc)]
 
 use libc::{c_char, c_int, c_long, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, S_IFDIR};
 use std::ffi::{CStr, CString};
@@ -38,7 +38,6 @@ use std::ptr::{null, null_mut};
 // PAM constants
 const PAM_SUCCESS: c_int = 0;
 const PAM_AUTHTOK: c_int = 27;
-const PAM_PRELIM_CHECK: c_int = 0x0001;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
 
 // Defaults
@@ -84,7 +83,6 @@ extern "C" {
     fn setegid(gid: gid_t) -> c_int;
     fn seteuid(uid: uid_t) -> c_int;
     fn setgid(gid: gid_t) -> c_int;
-    fn setuid(uid: uid_t) -> c_int;
     fn setresuid(ruid: uid_t, euid: uid_t, suid: uid_t) -> c_int;
 
     fn fork() -> pid_t;
@@ -93,20 +91,11 @@ extern "C" {
     fn clearenv() -> c_int;
     fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int;
     fn mkdir(path: *const c_char, mode: mode_t) -> c_int;
-    fn access(path: *const c_char, mode: c_int) -> c_int;
 
     fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
     fn pipe(fds: *mut c_int) -> c_int;
-    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn write(fd: c_int, buf: *const c_void, count: size_t) -> isize;
     fn close(fd: c_int) -> c_int;
-
-    fn free(ptr: *mut c_void);
-}
-
-#[cfg(target_os = "linux")]
-unsafe fn errno() -> c_int {
-    *libc::__errno_location()
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -123,12 +112,6 @@ unsafe fn syslog_warn(msg: &str) {
     let fmt = cstr("%s\0");
     let m = cstr(msg);
     syslog(libc::LOG_WARNING, fmt.as_ptr(), m.as_ptr());
-}
-
-unsafe fn syslog_info(msg: &str) {
-    let fmt = cstr("%s\0");
-    let m = cstr(msg);
-    syslog(libc::LOG_INFO, fmt.as_ptr(), m.as_ptr());
 }
 
 unsafe fn syslog_debug(msg: &str) {
@@ -220,7 +203,7 @@ unsafe fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<CString> {
     if rc == PAM_SUCCESS && !item.is_null() {
         let pass = CStr::from_ptr(item as *const c_char).to_bytes();
         if !pass.is_empty() {
-            return Some(CString::new(pass).ok()?);
+            return CString::new(pass).ok();
         }
     }
     // Fall back to prompting
