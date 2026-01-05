@@ -69,12 +69,13 @@ sudoedit /etc/pam.d/common-session-noninteractive
 ```
 
 Notes:
+
 - Leave the module without arguments to use the per-user defaults:
     - Cipher dir: `~/.gocryptfs`
     - Mount point: `~/Private`
 - If you insist on custom paths, pass absolute paths:
-    - Example (not per-user): `session optional pam_gocryptfs.so cipherdir=/home/alice/.gocryptfs mountpoint=/home/alice/Private`
-    - The module does not expand `~`, `%u`, or variables.
+    - Example: `session optional pam_gocryptfs.so cipherdir=/home/%(USER)/.gocryptfs mountpoint=~/Private`
+    - The module does expand `~/`, `%(USER)`, `%(USERUID)`, and `%(USERGID)`.
 
 ## Initialize per-user data
 
@@ -95,6 +96,7 @@ touch ~/.gocryptfs/auto-umount
 ```
 
 Now log out and log back in. On session open, the module will:
+
 - If not already mounted and `~/.gocryptfs/auto-mount` exists, run `gocryptfs` to mount `~/.gocryptfs` at `~/Private`.
 - On session close, if `~/.gocryptfs/auto-umount` exists, unmount `~/Private` using `fusermount3 -u`.
 

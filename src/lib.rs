@@ -178,10 +178,57 @@ fn mounts_contains(mountpoint: &str) -> bool {
     false
 }
 
-unsafe fn build_default_paths(home: &CStr, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString, CString) {
+// expand a variable that occured in a path specifier
+fn map_var(pwd: *mut passwd, name: &str) -> String {
+    match name {
+        "USER" => unsafe { CStr::from_ptr((*pwd).pw_name) }.to_string_lossy().to_string(),
+        "USERUID" => unsafe { (*pwd).pw_uid }.to_string(),
+        "USERGID" => unsafe { (*pwd).pw_gid }.to_string(),
+        _ => format!("%({})", name),
+    }
+}
+
+// expand all variables (and leading ~/) that occur in a path specifier
+fn expand_vars(pwd: *mut passwd, s: String) -> String {
+    // Expand home directory
+    let s = if let Some(p) = s.strip_prefix("~/") { format!("{}/{}", unsafe { CStr::from_ptr((*pwd).pw_dir) }.to_string_lossy(), p) } else { s };
+
+    // Expand variables
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    #[allow(clippy::while_let_on_iterator)]
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if let Some('(') = chars.peek() {
+                // Consume the '('
+                chars.next();
+                let mut var_name = String::new();
+                // Collect characters until ')'
+                while let Some(c) = chars.next() {
+                    if c == ')' {
+                        break;
+                    }
+                    var_name.push(c);
+                }
+                // Replace with the mapped value
+                result.push_str(&map_var(pwd, &var_name));
+            } else {
+                // Just push the '%' if not followed by '('
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+fn build_default_paths(pwd: *mut passwd, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString, CString) {
+    let home = unsafe { CStr::from_ptr((*pwd).pw_dir) };
     let home_str = home.to_string_lossy();
-    let cipherdir = cipher_arg.map(|s| s.to_string()).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
-    let mountpoint = mount_arg.map(|s| s.to_string()).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
+    let cipherdir = cipher_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
+    let mountpoint = mount_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
     let auto_mount = format!("{}/{}", cipherdir, AUTO_MOUNT_FILE);
     let auto_umount = format!("{}/{}", cipherdir, AUTO_UMOUNT_FILE);
     (CString::new(cipherdir).unwrap(), CString::new(mountpoint).unwrap(), CString::new(auto_mount).unwrap(), CString::new(auto_umount).unwrap())
@@ -419,8 +466,7 @@ pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_
 
     // Parse args and compute paths
     let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
-    let home = CStr::from_ptr((*pwd).pw_dir);
-    let (cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(home, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-mount toggle
     if !file_exists(&auto_mount) {
@@ -489,8 +535,7 @@ pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c
         return PAM_SUCCESS;
     }
     let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
-    let home = CStr::from_ptr((*pwd).pw_dir);
-    let (_cipherdir, mountpoint, _auto_mount, auto_umount) = build_default_paths(home, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (_cipherdir, mountpoint, _auto_mount, auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-umount toggle
     if !file_exists(&auto_umount) {
@@ -577,8 +622,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
 
     // Determine cipherdir (ignore mountpoint here)
     let (cipher_arg, _mount_arg) = parse_pam_args(argc, argv);
-    let home = CStr::from_ptr((*pwd).pw_dir);
-    let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(home, cipher_arg.as_deref(), None);
+    let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), None);
 
     // Ensure cipherdir has gocryptfs.conf
     let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
