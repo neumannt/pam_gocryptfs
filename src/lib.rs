@@ -28,10 +28,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(dead_code)]
 
-use libc::{
-    c_char, c_int, c_long, c_uint, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, O_CREAT,
-    O_NONBLOCK, O_WRONLY, S_IFDIR,
-};
+use libc::{c_char, c_int, c_long, c_uint, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, O_CREAT, O_NONBLOCK, O_WRONLY, S_IFDIR};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -146,19 +143,12 @@ unsafe fn fetch_pwd(pamh: *mut pam_handle_t) -> *mut passwd {
     let mut username_ptr: *const c_char = null();
     let rc = pam_get_user(pamh, &mut username_ptr, null());
     if rc != PAM_SUCCESS || username_ptr.is_null() {
-        syslog(
-            libc::LOG_ERR,
-            cstr("pam_gocryptfs: Error getting user; rc = [%d]\n\0").as_ptr(),
-            rc,
-        );
+        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error getting user; rc = [%d]\n\0").as_ptr(), rc);
         return null_mut();
     }
     let pwd = getpwnam(username_ptr);
     if pwd.is_null() {
-        syslog(
-            libc::LOG_ERR,
-            cstr("pam_gocryptfs: getpwnam() failed\n\0").as_ptr(),
-        );
+        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n\0").as_ptr());
     }
     pwd
 }
@@ -198,20 +188,11 @@ fn mounts_contains(mountpoint: &str) -> bool {
 
 unsafe fn build_default_paths(home: &CStr, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString, CString) {
     let home_str = home.to_string_lossy();
-    let cipherdir = cipher_arg
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
-    let mountpoint = mount_arg
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
+    let cipherdir = cipher_arg.map(|s| s.to_string()).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
+    let mountpoint = mount_arg.map(|s| s.to_string()).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
     let auto_mount = format!("{}/{}", cipherdir, AUTO_MOUNT_FILE);
     let auto_umount = format!("{}/{}", cipherdir, AUTO_UMOUNT_FILE);
-    (
-        CString::new(cipherdir).unwrap(),
-        CString::new(mountpoint).unwrap(),
-        CString::new(auto_mount).unwrap(),
-        CString::new(auto_umount).unwrap(),
-    )
+    (CString::new(cipherdir).unwrap(), CString::new(mountpoint).unwrap(), CString::new(auto_mount).unwrap(), CString::new(auto_umount).unwrap())
 }
 
 unsafe fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, Option<String>) {
@@ -301,19 +282,9 @@ unsafe fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
     Some((read_fd, write_fd))
 }
 
-unsafe fn mount_gocryptfs_as_user(
-    pwd: *mut passwd,
-    cipherdir: &CStr,
-    mountpoint: &CStr,
-    pass: &CStr,
-) {
+unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr) {
     // Ensure cipherdir has a config file
-    let conf_path = CString::new(format!(
-        "{}/{}",
-        cipherdir.to_string_lossy(),
-        GOCONF_FILE
-    ))
-    .unwrap();
+    let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
     if !file_exists(&conf_path) {
         syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping mount");
         return;
@@ -373,17 +344,7 @@ unsafe fn mount_gocryptfs_as_user(
             let a2 = cstr("-nosyslog\0");
             let a3 = cstr("-passfile\0");
 
-            execl(
-                bin.as_ptr(),
-                arg0.as_ptr(),
-                a1.as_ptr(),
-                a2.as_ptr(),
-                a3.as_ptr(),
-                passfile_arg.as_ptr(),
-                cipherdir.as_ptr(),
-                mountpoint.as_ptr(),
-                null::<c_char>(),
-            );
+            execl(bin.as_ptr(), arg0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), passfile_arg.as_ptr(), cipherdir.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
             // If execl returns, it failed
             libc::_exit(1);
         }
@@ -431,28 +392,11 @@ unsafe fn unmount_gocryptfs_as_user(pwd: *mut passwd, mountpoint: &CStr) {
             let arg_u = cstr("-u\0");
 
             // Try fusermount3
-            execl(
-                fusermount3.as_ptr(),
-                arg0_fm3.as_ptr(),
-                arg_u.as_ptr(),
-                mountpoint.as_ptr(),
-                null::<c_char>(),
-            );
+            execl(fusermount3.as_ptr(), arg0_fm3.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
             // Try fusermount
-            execl(
-                fusermount.as_ptr(),
-                arg0_fm.as_ptr(),
-                arg_u.as_ptr(),
-                mountpoint.as_ptr(),
-                null::<c_char>(),
-            );
+            execl(fusermount.as_ptr(), arg0_fm.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
             // Try umount
-            execl(
-                umount_bin.as_ptr(),
-                arg0_um.as_ptr(),
-                mountpoint.as_ptr(),
-                null::<c_char>(),
-            );
+            execl(umount_bin.as_ptr(), arg0_um.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
             libc::_exit(1);
         }
         libc::_exit(0);
@@ -464,33 +408,18 @@ unsafe fn unmount_gocryptfs_as_user(pwd: *mut passwd, mountpoint: &CStr) {
 // ----- PAM entry points -----
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_authenticate(
-    _pamh: *mut pam_handle_t,
-    _flags: c_int,
-    _argc: c_int,
-    _argv: *const *const c_char,
-) -> c_int {
+pub unsafe extern "C" fn pam_sm_authenticate(_pamh: *mut pam_handle_t, _flags: c_int, _argc: c_int, _argv: *const *const c_char) -> c_int {
     // We do not touch passwords or keyrings here. All work is done in open_session.
     PAM_SUCCESS
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_setcred(
-    _pamh: *mut pam_handle_t,
-    _flags: c_int,
-    _argc: c_int,
-    _argv: *const *const c_char,
-) -> c_int {
+pub unsafe extern "C" fn pam_sm_setcred(_pamh: *mut pam_handle_t, _flags: c_int, _argc: c_int, _argv: *const *const c_char) -> c_int {
     PAM_SUCCESS
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_open_session(
-    pamh: *mut pam_handle_t,
-    _flags: c_int,
-    argc: c_int,
-    argv: *const *const c_char,
-) -> c_int {
+pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let pwd = fetch_pwd(pamh);
     if pwd.is_null() {
         return PAM_SUCCESS;
@@ -499,8 +428,7 @@ pub unsafe extern "C" fn pam_sm_open_session(
     // Parse args and compute paths
     let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
     let home = CStr::from_ptr((*pwd).pw_dir);
-    let (cipherdir, mountpoint, auto_mount, _auto_umount) =
-        build_default_paths(home, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(home, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-mount toggle
     if !file_exists(&auto_mount) {
@@ -563,20 +491,14 @@ pub unsafe extern "C" fn pam_sm_open_session(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_close_session(
-    pamh: *mut pam_handle_t,
-    _flags: c_int,
-    argc: c_int,
-    argv: *const *const c_char,
-) -> c_int {
+pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let pwd = fetch_pwd(pamh);
     if pwd.is_null() {
         return PAM_SUCCESS;
     }
     let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
     let home = CStr::from_ptr((*pwd).pw_dir);
-    let (_cipherdir, mountpoint, _auto_mount, auto_umount) =
-        build_default_paths(home, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (_cipherdir, mountpoint, _auto_mount, auto_umount) = build_default_paths(home, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-umount toggle
     if !file_exists(&auto_umount) {
@@ -622,12 +544,7 @@ pub unsafe extern "C" fn pam_sm_close_session(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_chauthtok(
-    _pamh: *mut pam_handle_t,
-    _flags: c_int,
-    _argc: c_int,
-    _argv: *const *const c_char,
-) -> c_int {
+pub unsafe extern "C" fn pam_sm_chauthtok(_pamh: *mut pam_handle_t, _flags: c_int, _argc: c_int, _argv: *const *const c_char) -> c_int {
     // No-op: gocryptfs password changes are interactive (`gocryptfs -passwd`).
     // Integrating here would require orchestrating multiple prompts and is out of scope.
     PAM_SUCCESS
