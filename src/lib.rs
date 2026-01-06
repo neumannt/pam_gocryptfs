@@ -119,17 +119,19 @@ unsafe extern "C" fn cleanup_password(_pamh: *mut pam_handle_t, data: *mut c_voi
 }
 
 // Helper to store password into PAM handle using pam_set_data.
-// Expects a NUL-terminated pointer (char *) that we own (malloc/strdup allocated).
-unsafe fn store_password(pamh: *mut pam_handle_t, pw_owned: *mut c_char) -> c_int {
-    if pw_owned.is_null() {
-        return PAM_SUCCESS;
+fn store_password(pamh: *mut pam_handle_t, pass: &CStr) -> c_int {
+    unsafe {
+        let pw_owned = libc::strdup(pass.as_ptr());
+        if pw_owned.is_null() {
+            return PAM_SUCCESS;
+        }
+        let rc = pam_set_data(pamh, unique_data_key().as_ptr(), pw_owned as *mut c_void, Some(cleanup_password));
+        if rc != PAM_SUCCESS {
+            // If set_data failed, wipe+free immediately to avoid leaks
+            cleanup_password(pamh, pw_owned as *mut c_void, rc);
+        }
+        rc
     }
-    let rc = pam_set_data(pamh, unique_data_key().as_ptr(), pw_owned as *mut c_void, Some(cleanup_password));
-    if rc != PAM_SUCCESS {
-        // If set_data failed, wipe+free immediately to avoid leaks
-        cleanup_password(pamh, pw_owned as *mut c_void, rc);
-    }
-    rc
 }
 
 fn cstr(s: &str) -> CString {
@@ -195,13 +197,15 @@ fn file_exists(path: &CStr) -> bool {
     }
 }
 
-unsafe fn ensure_dir(path: &CStr, mode: mode_t) -> bool {
-    let mut s: libc::stat = zeroed();
-    if stat(path.as_ptr(), &mut s) == 0 {
-        // Exists, ensure directory
-        return (s.st_mode & libc::S_IFMT) == S_IFDIR;
+fn ensure_dir(path: &CStr, mode: mode_t) -> bool {
+    unsafe {
+        let mut s: libc::stat = zeroed();
+        if stat(path.as_ptr(), &mut s) == 0 {
+            // Exists, ensure directory
+            return (s.st_mode & libc::S_IFMT) == S_IFDIR;
+        }
+        mkdir(path.as_ptr(), mode) == 0
     }
-    mkdir(path.as_ptr(), mode) == 0
 }
 
 fn mounts_contains(mountpoint: &str) -> bool {
@@ -279,17 +283,19 @@ fn build_default_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: 
     (CString::new(cipherdir).unwrap(), CString::new(mountpoint).unwrap(), CString::new(auto_mount).unwrap(), CString::new(auto_umount).unwrap())
 }
 
-unsafe fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, Option<String>, bool) {
+fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, Option<String>, bool) {
     let mut cipherdir: Option<String> = None;
     let mut mountpoint: Option<String> = None;
     let mut allow_other = false;
     if argc > 0 && !argv.is_null() {
         for i in 0..argc {
-            let p = *argv.add(i as usize);
-            if p.is_null() {
-                continue;
-            }
-            let s = CStr::from_ptr(p).to_string_lossy();
+            let s = unsafe {
+                let p = *argv.add(i as usize);
+                if p.is_null() {
+                    continue;
+                }
+                CStr::from_ptr(p).to_string_lossy()
+            };
             if let Some(rest) = s.strip_prefix("cipherdir=") {
                 cipherdir = Some(rest.to_string());
             } else if let Some(rest) = s.strip_prefix("mountpoint=") {
@@ -302,74 +308,78 @@ unsafe fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<Str
     (cipherdir, mountpoint, allow_other)
 }
 
-unsafe fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<CString> {
-    // First try to get PAM_AUTHTOK
-    let mut item: *const c_void = null();
-    let rc = pam_get_item(pamh as *const pam_handle_t, PAM_AUTHTOK, &mut item);
-    if rc == PAM_SUCCESS && !item.is_null() {
-        let pass = CStr::from_ptr(item as *const c_char).to_bytes();
-        if !pass.is_empty() {
-            return CString::new(pass).ok();
+fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<CString> {
+    unsafe {
+        // First try to get PAM_AUTHTOK
+        let mut item: *const c_void = null();
+        let rc = pam_get_item(pamh as *const pam_handle_t, PAM_AUTHTOK, &mut item);
+        if rc == PAM_SUCCESS && !item.is_null() {
+            let pass = CStr::from_ptr(item as *const c_char).to_bytes();
+            if !pass.is_empty() {
+                return CString::new(pass).ok();
+            }
         }
+        // Fall back to prompting
+        let mut resp: *mut c_char = null_mut();
+        let prompt = cstr("gocryptfs passphrase: ");
+        let prc = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &mut resp, prompt.as_ptr());
+        if prc == PAM_SUCCESS && !resp.is_null() {
+            let out = CStr::from_ptr(resp).to_bytes();
+            let s = CString::new(out).ok();
+            // pam alloc for resp is managed by PAM; do not free here.
+            return s;
+        }
+        None
     }
-    // Fall back to prompting
-    let mut resp: *mut c_char = null_mut();
-    let prompt = cstr("gocryptfs passphrase: ");
-    let prc = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &mut resp, prompt.as_ptr());
-    if prc == PAM_SUCCESS && !resp.is_null() {
-        let out = CStr::from_ptr(resp).to_bytes();
-        let s = CString::new(out).ok();
-        // pam alloc for resp is managed by PAM; do not free here.
-        return s;
-    }
-    None
 }
 
-unsafe fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
-    let mut fds = [0i32; 2];
-    // Prefer pipe2 for atomic CLOEXEC setup
-    let use_pipe2 = {
-        // _GNU_SOURCE pipe2 is common; try and fallback
-        pipe2(fds.as_mut_ptr(), O_CLOEXEC) == 0
-    };
-    if !use_pipe2 {
-        if pipe(fds.as_mut_ptr()) != 0 {
+fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
+    unsafe {
+        let mut fds = [0i32; 2];
+        // Prefer pipe2 for atomic CLOEXEC setup
+        let use_pipe2 = {
+            // _GNU_SOURCE pipe2 is common; try and fallback
+            pipe2(fds.as_mut_ptr(), O_CLOEXEC) == 0
+        };
+        if !use_pipe2 {
+            if pipe(fds.as_mut_ptr()) != 0 {
+                return None;
+            }
+            // Set CLOEXEC on write end; we will clear it on read end
+            let flags = libc::fcntl(fds[0], libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fds[0], libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+            let flags_r = libc::fcntl(fds[1], libc::F_GETFD);
+            if flags_r >= 0 {
+                libc::fcntl(fds[1], libc::F_SETFD, flags_r | libc::FD_CLOEXEC);
+            }
+        }
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        // We must clear CLOEXEC on read_fd so the exec'ed gocryptfs can access /proc/self/fd/<read_fd>
+        let cur = libc::fcntl(read_fd, libc::F_GETFD);
+        if cur >= 0 {
+            libc::fcntl(read_fd, libc::F_SETFD, cur & !libc::FD_CLOEXEC);
+        }
+
+        // Write pass + newline
+        let mut buf = Vec::with_capacity(pass.len() + 1);
+        buf.extend_from_slice(pass);
+        buf.push(b'\n');
+        let wrote = write(write_fd, buf.as_ptr() as *const c_void, buf.len());
+        if wrote < 0 || wrote as usize != buf.len() {
+            close(read_fd);
+            close(write_fd);
             return None;
         }
-        // Set CLOEXEC on write end; we will clear it on read end
-        let flags = libc::fcntl(fds[0], libc::F_GETFD);
-        if flags >= 0 {
-            libc::fcntl(fds[0], libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        }
-        let flags_r = libc::fcntl(fds[1], libc::F_GETFD);
-        if flags_r >= 0 {
-            libc::fcntl(fds[1], libc::F_SETFD, flags_r | libc::FD_CLOEXEC);
-        }
+        // Keep write_fd open in parent until the child execs to avoid premature EOF
+        Some((read_fd, write_fd))
     }
-    let read_fd = fds[0];
-    let write_fd = fds[1];
-
-    // We must clear CLOEXEC on read_fd so the exec'ed gocryptfs can access /proc/self/fd/<read_fd>
-    let cur = libc::fcntl(read_fd, libc::F_GETFD);
-    if cur >= 0 {
-        libc::fcntl(read_fd, libc::F_SETFD, cur & !libc::FD_CLOEXEC);
-    }
-
-    // Write pass + newline
-    let mut buf = Vec::with_capacity(pass.len() + 1);
-    buf.extend_from_slice(pass);
-    buf.push(b'\n');
-    let wrote = write(write_fd, buf.as_ptr() as *const c_void, buf.len());
-    if wrote < 0 || wrote as usize != buf.len() {
-        close(read_fd);
-        close(write_fd);
-        return None;
-    }
-    // Keep write_fd open in parent until the child execs to avoid premature EOF
-    Some((read_fd, write_fd))
 }
 
-unsafe fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr, allow_other: bool) {
+fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr, allow_other: bool) {
     // Ensure cipherdir has a config file
     let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
     if !file_exists(&conf_path) {
@@ -393,103 +403,107 @@ unsafe fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &
         }
     };
 
-    let pid1 = fork();
-    if pid1 < 0 {
-        syslog_err("pam_gocryptfs: fork() failed");
+    unsafe {
+        let pid1 = fork();
+        if pid1 < 0 {
+            syslog_err("pam_gocryptfs: fork() failed");
+            close(read_fd);
+            close(write_fd);
+            return;
+        }
+        if pid1 == 0 {
+            // Child: run as the user
+            seteuid(oeuid);
+            clearenv();
+            if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
+                libc::_exit(1);
+            }
+            if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
+                libc::_exit(1);
+            }
+
+            // Close write end in grandchild right before exec (reader remains open)
+            close(write_fd);
+
+            // Build -passfile /proc/self/fd/<read_fd>
+            let passfile_arg = CString::new(format!("/proc/self/fd/{}", read_fd)).unwrap();
+
+            // Prepare the arguments
+            let bin = cstr(DEFAULT_GCRYPTFS_BIN);
+            let mut args: Vec<CString> = vec![cstr("gocryptfs"), cstr("-q"), cstr("-passfile"), passfile_arg];
+            if allow_other {
+                args.push(cstr("-allow_other"));
+            }
+
+            let mut argv: Vec<*const c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+            argv.push(cipherdir.as_ptr());
+            argv.push(mountpoint.as_ptr());
+            argv.push(std::ptr::null());
+
+            // Exec gocryptfs
+            execv(bin.as_ptr(), argv.as_ptr());
+            // If execl returns, it failed
+            libc::_exit(1);
+        }
+        // Parent: wait for first child
+        let mut st: c_int = 0;
+        let r = waitpid(pid1, &mut st, 0);
+        if r < 0 || st != 0 {
+            syslog_warn("pam_gocryptfs: gocrypts mount failed");
+        }
+
+        // Parent can close fds now
         close(read_fd);
         close(write_fd);
-        return;
     }
-    if pid1 == 0 {
-        // Child: run as the user
-        seteuid(oeuid);
-        clearenv();
-        if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
-            libc::_exit(1);
-        }
-        if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
-            libc::_exit(1);
-        }
-
-        // Close write end in grandchild right before exec (reader remains open)
-        close(write_fd);
-
-        // Build -passfile /proc/self/fd/<read_fd>
-        let passfile_arg = CString::new(format!("/proc/self/fd/{}", read_fd)).unwrap();
-
-        // Prepare the arguments
-        let bin = cstr(DEFAULT_GCRYPTFS_BIN);
-        let mut args: Vec<CString> = vec![cstr("gocryptfs"), cstr("-q"), cstr("-passfile"), passfile_arg];
-        if allow_other {
-            args.push(cstr("-allow_other"));
-        }
-
-        let mut argv: Vec<*const c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
-        argv.push(cipherdir.as_ptr());
-        argv.push(mountpoint.as_ptr());
-        argv.push(std::ptr::null());
-
-        // Exec gocryptfs
-        execv(bin.as_ptr(), argv.as_ptr());
-        // If execl returns, it failed
-        libc::_exit(1);
-    }
-    // Parent: wait for first child
-    let mut st: c_int = 0;
-    let r = waitpid(pid1, &mut st, 0);
-    if r < 0 || st != 0 {
-        syslog_warn("pam_gocryptfs: gocrypts mount failed");
-    }
-
-    // Parent can close fds now
-    close(read_fd);
-    close(write_fd);
 }
 
-unsafe fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr) {
-    // fork and exec fusermount3 -u mountpoint (fallback to fusermount, then umount)
-    let pid1 = fork();
-    if pid1 < 0 {
-        syslog_err("pam_gocryptfs: fork() failed (unmount)");
-        return;
-    }
-    if pid1 == 0 {
-        seteuid(oeuid);
-        clearenv();
-        if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
+fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr) {
+    unsafe {
+        // fork and exec fusermount3 -u mountpoint (fallback to fusermount, then umount)
+        let pid1 = fork();
+        if pid1 < 0 {
+            syslog_err("pam_gocryptfs: fork() failed (unmount)");
+            return;
+        }
+        if pid1 == 0 {
+            seteuid(oeuid);
+            clearenv();
+            if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
+                libc::_exit(1);
+            }
+            if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
+                libc::_exit(1);
+            }
+
+            let fusermount3 = cstr("/bin/fusermount3");
+            let fusermount = cstr("/bin/fusermount");
+            let umount_bin = cstr("/bin/umount");
+            let arg0_fm3 = cstr("fusermount3");
+            let arg0_fm = cstr("fusermount");
+            let arg0_um = cstr("umount");
+            let arg_u = cstr("-u");
+
+            // Try fusermount3
+            execl(fusermount3.as_ptr(), arg0_fm3.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
+            // Try fusermount
+            execl(fusermount.as_ptr(), arg0_fm.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
+            // Try umount
+            execl(umount_bin.as_ptr(), arg0_um.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
             libc::_exit(1);
         }
-        if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
-            libc::_exit(1);
+        let mut st: c_int = 0;
+        let r = waitpid(pid1, &mut st, 0);
+        if r < 0 || st != 0 {
+            syslog_warn("pam_gocryptfs: unmount failed");
         }
-
-        let fusermount3 = cstr("/bin/fusermount3");
-        let fusermount = cstr("/bin/fusermount");
-        let umount_bin = cstr("/bin/umount");
-        let arg0_fm3 = cstr("fusermount3");
-        let arg0_fm = cstr("fusermount");
-        let arg0_um = cstr("umount");
-        let arg_u = cstr("-u");
-
-        // Try fusermount3
-        execl(fusermount3.as_ptr(), arg0_fm3.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
-        // Try fusermount
-        execl(fusermount.as_ptr(), arg0_fm.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
-        // Try umount
-        execl(umount_bin.as_ptr(), arg0_um.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
-        libc::_exit(1);
-    }
-    let mut st: c_int = 0;
-    let r = waitpid(pid1, &mut st, 0);
-    if r < 0 || st != 0 {
-        syslog_warn("pam_gocryptfs: unmount failed");
     }
 }
 
 // ----- PAM entry points -----
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
+pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let pwd = fetch_pwd(pamh);
     let pwd = if let Some(pwd) = pwd {
         pwd
@@ -521,16 +535,16 @@ pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_
             return PAM_SUCCESS;
         }
     };
-    store_password(pamh, libc::strdup(pass.as_ptr()))
+    store_password(pamh, &pass)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_setcred(_pamh: *mut pam_handle_t, _flags: c_int, _argc: c_int, _argv: *const *const c_char) -> c_int {
+pub extern "C" fn pam_sm_setcred(_pamh: *mut pam_handle_t, _flags: c_int, _argc: c_int, _argv: *const *const c_char) -> c_int {
     PAM_SUCCESS
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
+pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let pwd = fetch_pwd(pamh);
     let pwd = if let Some(pwd) = pwd {
         pwd
@@ -552,50 +566,52 @@ pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_
         return PAM_SUCCESS;
     }
 
-    // Temporarily drop to user for mounting
-    let oeuid = geteuid();
-    let oegid = getegid();
+    unsafe {
+        // Temporarily drop to user for mounting
+        let oeuid = geteuid();
+        let oegid = getegid();
 
-    let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
-    let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
-    let mut groups: Vec<gid_t> = vec![0; max_groups];
-    let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
-    let restore_privs = || {
-        seteuid(oeuid);
-        setegid(oegid);
-        if ngids > 0 {
-            let _ = setgroups(ngids, groups.as_ptr());
+        let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
+        let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
+        let mut groups: Vec<gid_t> = vec![0; max_groups];
+        let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
+        let restore_privs = || {
+            seteuid(oeuid);
+            setegid(oegid);
+            if ngids > 0 {
+                let _ = setgroups(ngids, groups.as_ptr());
+            }
+        };
+
+        if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
+            syslog_err("pam_gocryptfs: failed to drop privileges");
+            // Attempt to restore anyway
+            restore_privs();
+            return PAM_SUCCESS;
         }
-    };
 
-    if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
-        syslog_err("pam_gocryptfs: failed to drop privileges");
-        // Attempt to restore anyway
+        // Obtain passphrase
+        let mut pass_ptr: *const c_void = zeroed();
+        let rc = pam_get_data(pamh, unique_data_key().as_ptr(), &mut pass_ptr);
+        if rc != PAM_SUCCESS {
+            syslog_warn("pam_gocryptfs: unable to retrieve passphrase; skipping mount");
+            restore_privs();
+            return PAM_SUCCESS;
+        }
+        let pass = CStr::from_ptr(pass_ptr as *const c_char);
+
+        // Mount
+        mount_gocryptfs_as_user(&pwd, oeuid, &cipherdir, &mountpoint, pass, allow_other);
+
+        // Restore privileges
         restore_privs();
-        return PAM_SUCCESS;
     }
-
-    // Obtain passphrase
-    let mut pass_ptr: *const c_void = zeroed();
-    let rc = pam_get_data(pamh, unique_data_key().as_ptr(), &mut pass_ptr);
-    if rc != PAM_SUCCESS {
-        syslog_warn("pam_gocryptfs: unable to retrieve passphrase; skipping mount");
-        restore_privs();
-        return PAM_SUCCESS;
-    }
-    let pass = CStr::from_ptr(pass_ptr as *const c_char);
-
-    // Mount
-    mount_gocryptfs_as_user(&pwd, oeuid, &cipherdir, &mountpoint, pass, allow_other);
-
-    // Restore privileges
-    restore_privs();
 
     PAM_SUCCESS
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
+pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let pwd = fetch_pwd(pamh);
     let pwd = if let Some(pwd) = pwd {
         pwd
@@ -616,39 +632,41 @@ pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c
         return PAM_SUCCESS;
     }
 
-    // Drop to user and unmount
-    let oeuid = geteuid();
-    let oegid = getegid();
+    unsafe {
+        // Drop to user and unmount
+        let oeuid = geteuid();
+        let oegid = getegid();
 
-    let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
-    let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
-    let mut groups: Vec<gid_t> = vec![0; max_groups];
-    let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
-    let restore_privs = || {
-        seteuid(oeuid);
-        setegid(oegid);
-        if ngids > 0 {
-            let _ = setgroups(ngids, groups.as_ptr());
+        let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
+        let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
+        let mut groups: Vec<gid_t> = vec![0; max_groups];
+        let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
+        let restore_privs = || {
+            seteuid(oeuid);
+            setegid(oegid);
+            if ngids > 0 {
+                let _ = setgroups(ngids, groups.as_ptr());
+            }
+        };
+
+        if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
+            syslog_err("pam_gocryptfs: failed to drop privileges (umount)");
+            // Attempt to restore anyway
+            restore_privs();
+            return PAM_SUCCESS;
         }
-    };
 
-    if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
-        syslog_err("pam_gocryptfs: failed to drop privileges (umount)");
-        // Attempt to restore anyway
+        unmount_gocryptfs_as_user(&pwd, oeuid, &mountpoint);
+
+        // Restore
         restore_privs();
-        return PAM_SUCCESS;
     }
-
-    unmount_gocryptfs_as_user(&pwd, oeuid, &mountpoint);
-
-    // Restore
-    restore_privs();
 
     PAM_SUCCESS
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
+pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     // Fetch user
     let pwd = fetch_pwd(pamh);
     let pwd = if let Some(pwd) = pwd {
@@ -657,149 +675,151 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
         return PAM_SUCCESS;
     };
 
-    // Get old password
-    let mut item: *const c_void = null();
-    let rc_old = pam_get_item(pamh as *const pam_handle_t, PAM_OLDAUTHTOK, &mut item);
-    if rc_old != PAM_SUCCESS {
-        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving old passphrase; rc = [%d]\n").as_ptr(), rc_old);
-        return PAM_SUCCESS;
-    }
-    let old_pass_ptr = item as *const c_char;
+    unsafe {
+        // Get old password
+        let mut item: *const c_void = null();
+        let rc_old = pam_get_item(pamh as *const pam_handle_t, PAM_OLDAUTHTOK, &mut item);
+        if rc_old != PAM_SUCCESS {
+            syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving old passphrase; rc = [%d]\n").as_ptr(), rc_old);
+            return PAM_SUCCESS;
+        }
+        let old_pass_ptr = item as *const c_char;
 
-    // On PRELIM_CHECK, only verify we have the old password
-    if (flags & PAM_PRELIM_CHECK) != 0 {
-        if old_pass_ptr.is_null() || CStr::from_ptr(old_pass_ptr).to_bytes().is_empty() {
-            syslog_warn("pam_gocryptfs: PRELIM_CHECK: old password is missing");
+        // On PRELIM_CHECK, only verify we have the old password
+        if (flags & PAM_PRELIM_CHECK) != 0 {
+            if old_pass_ptr.is_null() || CStr::from_ptr(old_pass_ptr).to_bytes().is_empty() {
+                syslog_warn("pam_gocryptfs: PRELIM_CHECK: old password is missing");
+                return PAM_AUTHTOK_RECOVERY_ERR;
+            }
+            return PAM_SUCCESS;
+        }
+
+        // Get new password
+        item = null();
+        let rc_new = pam_get_item(pamh as *const pam_handle_t, PAM_AUTHTOK, &mut item);
+        if rc_new != PAM_SUCCESS {
+            syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving new passphrase; rc = [%d]\n").as_ptr(), rc_new);
+            return PAM_SUCCESS;
+        }
+        let new_pass_ptr = item as *const c_char;
+
+        if old_pass_ptr.is_null() || new_pass_ptr.is_null() || CStr::from_ptr(new_pass_ptr).to_bytes().is_empty() {
+            syslog_warn("pam_gocryptfs: at least one passphrase is NULL/empty; skipping password change");
             return PAM_AUTHTOK_RECOVERY_ERR;
         }
-        return PAM_SUCCESS;
-    }
 
-    // Get new password
-    item = null();
-    let rc_new = pam_get_item(pamh as *const pam_handle_t, PAM_AUTHTOK, &mut item);
-    if rc_new != PAM_SUCCESS {
-        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error retrieving new passphrase; rc = [%d]\n").as_ptr(), rc_new);
-        return PAM_SUCCESS;
-    }
-    let new_pass_ptr = item as *const c_char;
+        // Determine cipherdir (ignore mountpoint here)
+        let (cipher_arg, _mount_arg, _) = parse_pam_args(argc, argv);
+        let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), None);
 
-    if old_pass_ptr.is_null() || new_pass_ptr.is_null() || CStr::from_ptr(new_pass_ptr).to_bytes().is_empty() {
-        syslog_warn("pam_gocryptfs: at least one passphrase is NULL/empty; skipping password change");
-        return PAM_AUTHTOK_RECOVERY_ERR;
-    }
-
-    // Determine cipherdir (ignore mountpoint here)
-    let (cipher_arg, _mount_arg, _) = parse_pam_args(argc, argv);
-    let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), None);
-
-    // Ensure cipherdir has gocryptfs.conf
-    let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
-    if !file_exists(&conf_path) {
-        syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping password change");
-        return PAM_SUCCESS;
-    }
-
-    // Prepare stdin pipe for old and new password (we will write it twice with newlines)
-    let mut stdin_fds = [0i32; 2];
-    let have_pipe2 = pipe2(stdin_fds.as_mut_ptr(), libc::O_CLOEXEC) == 0;
-    if !have_pipe2 && pipe(stdin_fds.as_mut_ptr()) != 0 {
-        syslog_err("pam_gocryptfs: Failed to create stdin pipe");
-        return PAM_SUCCESS;
-    }
-    let stdin_rd = stdin_fds[0];
-    let stdin_wr = stdin_fds[1];
-
-    // Drop privileges to the user for the exec
-    let oeuid = geteuid();
-    let oegid = getegid();
-    let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
-    let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
-    let mut groups: Vec<gid_t> = vec![0; max_groups];
-    let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
-
-    let restore_privs = || {
-        let _ = seteuid(oeuid);
-        let _ = setegid(oegid);
-        if ngids > 0 {
-            let _ = setgroups(ngids, groups.as_ptr());
+        // Ensure cipherdir has gocryptfs.conf
+        let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
+        if !file_exists(&conf_path) {
+            syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping password change");
+            return PAM_SUCCESS;
         }
-    };
 
-    if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
-        syslog_err("pam_gocryptfs: failed to drop privileges for password change");
-        close(stdin_rd);
-        close(stdin_wr);
-        restore_privs();
-        return PAM_SUCCESS;
-    }
+        // Prepare stdin pipe for old and new password (we will write it twice with newlines)
+        let mut stdin_fds = [0i32; 2];
+        let have_pipe2 = pipe2(stdin_fds.as_mut_ptr(), libc::O_CLOEXEC) == 0;
+        if !have_pipe2 && pipe(stdin_fds.as_mut_ptr()) != 0 {
+            syslog_err("pam_gocryptfs: Failed to create stdin pipe");
+            return PAM_SUCCESS;
+        }
+        let stdin_rd = stdin_fds[0];
+        let stdin_wr = stdin_fds[1];
 
-    // Fork and exec: gocryptfs -passwd -passfile /proc/self/fd/<old_rd> <cipherdir>
-    // The new password is provided twice via child's stdin.
-    let pid = fork();
-    if pid < 0 {
-        syslog_err("pam_gocryptfs: fork() failed for password change");
-        close(stdin_rd);
-        close(stdin_wr);
-        restore_privs();
-        return PAM_SUCCESS;
-    }
+        // Drop privileges to the user for the exec
+        let oeuid = geteuid();
+        let oegid = getegid();
+        let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
+        let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
+        let mut groups: Vec<gid_t> = vec![0; max_groups];
+        let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
 
-    if pid == 0 {
-        // Child
-        clearenv();
+        let restore_privs = || {
+            let _ = seteuid(oeuid);
+            let _ = setegid(oegid);
+            if ngids > 0 {
+                let _ = setgroups(ngids, groups.as_ptr());
+            }
+        };
 
-        // Ensure we fully run as the user (ruid/euid/suid)
-        if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
+        if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
+            syslog_err("pam_gocryptfs: failed to drop privileges for password change");
+            close(stdin_rd);
+            close(stdin_wr);
+            restore_privs();
+            return PAM_SUCCESS;
+        }
+
+        // Fork and exec: gocryptfs -passwd -passfile /proc/self/fd/<old_rd> <cipherdir>
+        // The new password is provided twice via child's stdin.
+        let pid = fork();
+        if pid < 0 {
+            syslog_err("pam_gocryptfs: fork() failed for password change");
+            close(stdin_rd);
+            close(stdin_wr);
+            restore_privs();
+            return PAM_SUCCESS;
+        }
+
+        if pid == 0 {
+            // Child
+            clearenv();
+
+            // Ensure we fully run as the user (ruid/euid/suid)
+            if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
+                libc::_exit(1);
+            }
+
+            // Close write ends in child; we will only read
+            close(stdin_wr);
+
+            // Connect stdin pipe read end to STDIN
+            if libc::dup2(stdin_rd, 0) < 0 {
+                libc::_exit(1);
+            }
+            close(stdin_rd);
+
+            let bin = cstr(DEFAULT_GCRYPTFS_BIN);
+            let arg0 = cstr("gocryptfs");
+            let a_q = cstr("-q");
+            let a_nosyslog = cstr("-nosyslog");
+            let a_passwd = cstr("-passwd");
+
+            execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), cipherdir.as_ptr(), null::<c_char>());
+            // If we get here, exec failed
             libc::_exit(1);
         }
 
-        // Close write ends in child; we will only read
-        close(stdin_wr);
-
-        // Connect stdin pipe read end to STDIN
-        if libc::dup2(stdin_rd, 0) < 0 {
-            libc::_exit(1);
-        }
+        // Parent: we no longer need read ends
         close(stdin_rd);
 
-        let bin = cstr(DEFAULT_GCRYPTFS_BIN);
-        let arg0 = cstr("gocryptfs");
-        let a_q = cstr("-q");
-        let a_nosyslog = cstr("-nosyslog");
-        let a_passwd = cstr("-passwd");
+        // Parent: write old password + new password twice + newline to child's stdin, then close
+        let old_c = CStr::from_ptr(old_pass_ptr);
+        let new_c = CStr::from_ptr(new_pass_ptr);
+        let mut buf = Vec::with_capacity(old_c.to_bytes().len() + new_c.to_bytes().len() * 2 + 3);
+        buf.extend_from_slice(old_c.to_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(new_c.to_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(new_c.to_bytes());
+        buf.push(b'\n');
 
-        execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), cipherdir.as_ptr(), null::<c_char>());
-        // If we get here, exec failed
-        libc::_exit(1);
+        let wrote = write(stdin_wr, buf.as_ptr() as *const c_void, buf.len());
+        if wrote < 0 || wrote as usize != buf.len() {
+            syslog_err("pam_gocryptfs: Failed to write new password to stdin");
+        }
+        close(stdin_wr);
+
+        // Wait for child to finish
+        let mut _st: c_int = 0;
+        let _ = waitpid(pid, &mut _st, 0);
+
+        // Restore privileges
+        restore_privs();
     }
-
-    // Parent: we no longer need read ends
-    close(stdin_rd);
-
-    // Parent: write old password + new password twice + newline to child's stdin, then close
-    let old_c = CStr::from_ptr(old_pass_ptr);
-    let new_c = CStr::from_ptr(new_pass_ptr);
-    let mut buf = Vec::with_capacity(old_c.to_bytes().len() + new_c.to_bytes().len() * 2 + 3);
-    buf.extend_from_slice(old_c.to_bytes());
-    buf.push(b'\n');
-    buf.extend_from_slice(new_c.to_bytes());
-    buf.push(b'\n');
-    buf.extend_from_slice(new_c.to_bytes());
-    buf.push(b'\n');
-
-    let wrote = write(stdin_wr, buf.as_ptr() as *const c_void, buf.len());
-    if wrote < 0 || wrote as usize != buf.len() {
-        syslog_err("pam_gocryptfs: Failed to write new password to stdin");
-    }
-    close(stdin_wr);
-
-    // Wait for child to finish
-    let mut _st: c_int = 0;
-    let _ = waitpid(pid, &mut _st, 0);
-
-    // Restore privileges
-    restore_privs();
 
     PAM_SUCCESS
 }
