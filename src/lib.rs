@@ -160,18 +160,32 @@ fn syslog_debug(msg: &str) {
     }
 }
 
-unsafe fn fetch_pwd(pamh: *mut pam_handle_t) -> *mut passwd {
-    let mut username_ptr: *const c_char = null();
-    let rc = pam_get_user(pamh, &mut username_ptr, null());
-    if rc != PAM_SUCCESS || username_ptr.is_null() {
-        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error getting user; rc = [%d]\n").as_ptr(), rc);
-        return null_mut();
+struct PasswordInfo {
+    name: &'static CStr,
+    dir: &'static CStr,
+    uid: uid_t,
+    gid: gid_t,
+}
+
+fn fetch_pwd(pamh: *mut pam_handle_t) -> Option<PasswordInfo> {
+    unsafe {
+        let mut username_ptr: *const c_char = null();
+        let rc = pam_get_user(pamh, &mut username_ptr, null());
+        if rc != PAM_SUCCESS || username_ptr.is_null() {
+            syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error getting user; rc = [%d]\n").as_ptr(), rc);
+            return None;
+        }
+        let pwd = getpwnam(username_ptr);
+        if pwd.is_null() {
+            syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n").as_ptr());
+        }
+        Some(PasswordInfo {
+            name: CStr::from_ptr((*pwd).pw_name),
+            dir: CStr::from_ptr((*pwd).pw_dir),
+            uid: (*pwd).pw_uid,
+            gid: (*pwd).pw_gid,
+        })
     }
-    let pwd = getpwnam(username_ptr);
-    if pwd.is_null() {
-        syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n").as_ptr());
-    }
-    pwd
 }
 
 fn file_exists(path: &CStr) -> bool {
@@ -210,19 +224,19 @@ fn mounts_contains(mountpoint: &str) -> bool {
 }
 
 // expand a variable that occured in a path specifier
-fn map_var(pwd: *mut passwd, name: &str) -> String {
+fn map_var(pwd: &PasswordInfo, name: &str) -> String {
     match name {
-        "USER" => unsafe { CStr::from_ptr((*pwd).pw_name) }.to_string_lossy().to_string(),
-        "USERUID" => unsafe { (*pwd).pw_uid }.to_string(),
-        "USERGID" => unsafe { (*pwd).pw_gid }.to_string(),
+        "USER" => pwd.name.to_string_lossy().to_string(),
+        "USERUID" => pwd.uid.to_string(),
+        "USERGID" => pwd.gid.to_string(),
         _ => format!("%({})", name),
     }
 }
 
 // expand all variables (and leading ~/) that occur in a path specifier
-fn expand_vars(pwd: *mut passwd, s: String) -> String {
+fn expand_vars(pwd: &PasswordInfo, s: String) -> String {
     // Expand home directory
-    let s = if let Some(p) = s.strip_prefix("~/") { format!("{}/{}", unsafe { CStr::from_ptr((*pwd).pw_dir) }.to_string_lossy(), p) } else { s };
+    let s = if let Some(p) = s.strip_prefix("~/") { format!("{}/{}", pwd.dir.to_string_lossy(), p) } else { s };
 
     // Expand variables
     let mut result = String::new();
@@ -255,8 +269,8 @@ fn expand_vars(pwd: *mut passwd, s: String) -> String {
     result
 }
 
-fn build_default_paths(pwd: *mut passwd, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString, CString) {
-    let home = unsafe { CStr::from_ptr((*pwd).pw_dir) };
+fn build_default_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString, CString) {
+    let home = pwd.dir;
     let home_str = home.to_string_lossy();
     let cipherdir = cipher_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
     let mountpoint = mount_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
@@ -355,7 +369,7 @@ unsafe fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
     Some((read_fd, write_fd))
 }
 
-unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr, allow_other: bool) {
+unsafe fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr, allow_other: bool) {
     // Ensure cipherdir has a config file
     let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
     if !file_exists(&conf_path) {
@@ -390,10 +404,10 @@ unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CS
         // Child: run as the user
         seteuid(oeuid);
         clearenv();
-        if setgroups(1, &(*pwd).pw_gid as *const gid_t) < 0 || setgid((*pwd).pw_gid) < 0 {
+        if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
             libc::_exit(1);
         }
-        if setresuid((*pwd).pw_uid, (*pwd).pw_uid, (*pwd).pw_uid) < 0 {
+        if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
             libc::_exit(1);
         }
 
@@ -432,7 +446,7 @@ unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CS
     close(write_fd);
 }
 
-unsafe fn unmount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, mountpoint: &CStr) {
+unsafe fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr) {
     // fork and exec fusermount3 -u mountpoint (fallback to fusermount, then umount)
     let pid1 = fork();
     if pid1 < 0 {
@@ -442,10 +456,10 @@ unsafe fn unmount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, mountpoint: 
     if pid1 == 0 {
         seteuid(oeuid);
         clearenv();
-        if setgroups(1, &(*pwd).pw_gid as *const gid_t) < 0 || setgid((*pwd).pw_gid) < 0 {
+        if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
             libc::_exit(1);
         }
-        if setresuid((*pwd).pw_uid, (*pwd).pw_uid, (*pwd).pw_uid) < 0 {
+        if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
             libc::_exit(1);
         }
 
@@ -477,13 +491,15 @@ unsafe fn unmount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, mountpoint: 
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let pwd = fetch_pwd(pamh);
-    if pwd.is_null() {
+    let pwd = if let Some(pwd) = pwd {
+        pwd
+    } else {
         return PAM_SUCCESS;
-    }
+    };
 
     // Parse args and compute paths
     let (cipher_arg, mount_arg, _) = parse_pam_args(argc, argv);
-    let (_cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (_cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-mount toggle
     if !file_exists(&auto_mount) {
@@ -516,13 +532,15 @@ pub unsafe extern "C" fn pam_sm_setcred(_pamh: *mut pam_handle_t, _flags: c_int,
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let pwd = fetch_pwd(pamh);
-    if pwd.is_null() {
+    let pwd = if let Some(pwd) = pwd {
+        pwd
+    } else {
         return PAM_SUCCESS;
-    }
+    };
 
     // Parse args and compute paths
     let (cipher_arg, mount_arg, allow_other) = parse_pam_args(argc, argv);
-    let (cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-mount toggle
     if !file_exists(&auto_mount) {
@@ -550,7 +568,7 @@ pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_
         }
     };
 
-    if setegid((*pwd).pw_gid) < 0 || setgroups(1, &(*pwd).pw_gid as *const gid_t) < 0 || seteuid((*pwd).pw_uid) < 0 {
+    if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
         syslog_err("pam_gocryptfs: failed to drop privileges");
         // Attempt to restore anyway
         restore_privs();
@@ -568,7 +586,7 @@ pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_
     let pass = CStr::from_ptr(pass_ptr as *const c_char);
 
     // Mount
-    mount_gocryptfs_as_user(pwd, oeuid, &cipherdir, &mountpoint, pass, allow_other);
+    mount_gocryptfs_as_user(&pwd, oeuid, &cipherdir, &mountpoint, pass, allow_other);
 
     // Restore privileges
     restore_privs();
@@ -579,11 +597,13 @@ pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let pwd = fetch_pwd(pamh);
-    if pwd.is_null() {
+    let pwd = if let Some(pwd) = pwd {
+        pwd
+    } else {
         return PAM_SUCCESS;
-    }
+    };
     let (cipher_arg, mount_arg, _) = parse_pam_args(argc, argv);
-    let (_cipherdir, mountpoint, _auto_mount, auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (_cipherdir, mountpoint, _auto_mount, auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-umount toggle
     if !file_exists(&auto_umount) {
@@ -612,14 +632,14 @@ pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c
         }
     };
 
-    if setegid((*pwd).pw_gid) < 0 || setgroups(1, &(*pwd).pw_gid as *const gid_t) < 0 || seteuid((*pwd).pw_uid) < 0 {
+    if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
         syslog_err("pam_gocryptfs: failed to drop privileges (umount)");
         // Attempt to restore anyway
         restore_privs();
         return PAM_SUCCESS;
     }
 
-    unmount_gocryptfs_as_user(pwd, oeuid, &mountpoint);
+    unmount_gocryptfs_as_user(&pwd, oeuid, &mountpoint);
 
     // Restore
     restore_privs();
@@ -631,9 +651,11 @@ pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c
 pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     // Fetch user
     let pwd = fetch_pwd(pamh);
-    if pwd.is_null() {
+    let pwd = if let Some(pwd) = pwd {
+        pwd
+    } else {
         return PAM_SUCCESS;
-    }
+    };
 
     // Get old password
     let mut item: *const c_void = null();
@@ -669,7 +691,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
 
     // Determine cipherdir (ignore mountpoint here)
     let (cipher_arg, _mount_arg, _) = parse_pam_args(argc, argv);
-    let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), None);
+    let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), None);
 
     // Ensure cipherdir has gocryptfs.conf
     let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
@@ -704,7 +726,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
         }
     };
 
-    if setegid((*pwd).pw_gid) < 0 || setgroups(1, &(*pwd).pw_gid as *const gid_t) < 0 || seteuid((*pwd).pw_uid) < 0 {
+    if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
         syslog_err("pam_gocryptfs: failed to drop privileges for password change");
         close(stdin_rd);
         close(stdin_wr);
@@ -728,7 +750,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
         clearenv();
 
         // Ensure we fully run as the user (ruid/euid/suid)
-        if setresuid((*pwd).pw_uid, (*pwd).pw_uid, (*pwd).pw_uid) < 0 {
+        if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
             libc::_exit(1);
         }
 
