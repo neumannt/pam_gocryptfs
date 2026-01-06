@@ -379,6 +379,20 @@ fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
     }
 }
 
+// Become the mounting user in a child process
+fn impersonate_user_after_fork(pwd: &PasswordInfo, oeuid: uid_t) {
+    unsafe {
+        seteuid(oeuid);
+        clearenv();
+        if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
+            libc::_exit(1);
+        }
+        if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
+            libc::_exit(1);
+        }
+    }
+}
+
 fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr, allow_other: bool) {
     // Ensure cipherdir has a config file
     let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
@@ -413,14 +427,7 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &CStr, m
         }
         if pid1 == 0 {
             // Child: run as the user
-            seteuid(oeuid);
-            clearenv();
-            if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
-                libc::_exit(1);
-            }
-            if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
-                libc::_exit(1);
-            }
+            impersonate_user_after_fork(&pwd, oeuid);
 
             // Close write end in grandchild right before exec (reader remains open)
             close(write_fd);
@@ -467,14 +474,7 @@ fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr
             return;
         }
         if pid1 == 0 {
-            seteuid(oeuid);
-            clearenv();
-            if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
-                libc::_exit(1);
-            }
-            if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
-                libc::_exit(1);
-            }
+            impersonate_user_after_fork(&pwd, oeuid);
 
             let fusermount3 = cstr("/bin/fusermount3");
             let fusermount = cstr("/bin/fusermount");
@@ -766,12 +766,7 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
 
         if pid == 0 {
             // Child
-            clearenv();
-
-            // Ensure we fully run as the user (ruid/euid/suid)
-            if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
-                libc::_exit(1);
-            }
+            impersonate_user_after_fork(&pwd, oeuid);
 
             // Close write ends in child; we will only read
             close(stdin_wr);
