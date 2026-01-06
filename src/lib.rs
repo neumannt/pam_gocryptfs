@@ -93,6 +93,7 @@ extern "C" {
     fn fork() -> pid_t;
     fn waitpid(pid: pid_t, status: *mut c_int, options: c_int) -> pid_t;
     fn execl(path: *const c_char, arg0: *const c_char, ...) -> c_int;
+    fn execv(path: *const c_char, argv: *const *const c_char) -> libc::c_int;
     fn clearenv() -> c_int;
     fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int;
     fn mkdir(path: *const c_char, mode: mode_t) -> c_int;
@@ -264,9 +265,10 @@ fn build_default_paths(pwd: *mut passwd, cipher_arg: Option<&str>, mount_arg: Op
     (CString::new(cipherdir).unwrap(), CString::new(mountpoint).unwrap(), CString::new(auto_mount).unwrap(), CString::new(auto_umount).unwrap())
 }
 
-unsafe fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, Option<String>) {
+unsafe fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, Option<String>, bool) {
     let mut cipherdir: Option<String> = None;
     let mut mountpoint: Option<String> = None;
+    let mut allow_other = false;
     if argc > 0 && !argv.is_null() {
         for i in 0..argc {
             let p = *argv.add(i as usize);
@@ -278,10 +280,12 @@ unsafe fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<Str
                 cipherdir = Some(rest.to_string());
             } else if let Some(rest) = s.strip_prefix("mountpoint=") {
                 mountpoint = Some(rest.to_string());
+            } else if s == "allow_other" {
+                allow_other = true;
             }
         }
     }
-    (cipherdir, mountpoint)
+    (cipherdir, mountpoint, allow_other)
 }
 
 unsafe fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<CString> {
@@ -351,7 +355,7 @@ unsafe fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
     Some((read_fd, write_fd))
 }
 
-unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr) {
+unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr, allow_other: bool) {
     // Ensure cipherdir has a config file
     let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
     if !file_exists(&conf_path) {
@@ -399,14 +403,20 @@ unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CS
         // Build -passfile /proc/self/fd/<read_fd>
         let passfile_arg = CString::new(format!("/proc/self/fd/{}", read_fd)).unwrap();
 
-        // Exec gocryptfs
+        // Prepare the arguments
         let bin = cstr(DEFAULT_GCRYPTFS_BIN);
-        let arg0 = cstr("gocryptfs");
-        let a1 = cstr("-q");
-        let a2 = cstr("-nosyslog");
-        let a3 = cstr("-passfile");
+        let mut args: Vec<CString> = vec![cstr("gocryptfs"), cstr("-q"), cstr("-passfile"), passfile_arg];
+        if allow_other {
+            args.push(cstr("-allow_other"));
+        }
 
-        execl(bin.as_ptr(), arg0.as_ptr(), a1.as_ptr(), a2.as_ptr(), a3.as_ptr(), passfile_arg.as_ptr(), cipherdir.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
+        let mut argv: Vec<*const c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+        argv.push(cipherdir.as_ptr());
+        argv.push(mountpoint.as_ptr());
+        argv.push(std::ptr::null());
+
+        // Exec gocryptfs
+        execv(bin.as_ptr(), argv.as_ptr());
         // If execl returns, it failed
         libc::_exit(1);
     }
@@ -472,7 +482,7 @@ pub unsafe extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_
     }
 
     // Parse args and compute paths
-    let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
+    let (cipher_arg, mount_arg, _) = parse_pam_args(argc, argv);
     let (_cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-mount toggle
@@ -511,7 +521,7 @@ pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_
     }
 
     // Parse args and compute paths
-    let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
+    let (cipher_arg, mount_arg, allow_other) = parse_pam_args(argc, argv);
     let (cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-mount toggle
@@ -558,7 +568,7 @@ pub unsafe extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_
     let pass = CStr::from_ptr(pass_ptr as *const c_char);
 
     // Mount
-    mount_gocryptfs_as_user(pwd, oeuid, &cipherdir, &mountpoint, pass);
+    mount_gocryptfs_as_user(pwd, oeuid, &cipherdir, &mountpoint, pass, allow_other);
 
     // Restore privileges
     restore_privs();
@@ -572,7 +582,7 @@ pub unsafe extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c
     if pwd.is_null() {
         return PAM_SUCCESS;
     }
-    let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
+    let (cipher_arg, mount_arg, _) = parse_pam_args(argc, argv);
     let (_cipherdir, mountpoint, _auto_mount, auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-umount toggle
@@ -658,7 +668,7 @@ pub unsafe extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int,
     }
 
     // Determine cipherdir (ignore mountpoint here)
-    let (cipher_arg, _mount_arg) = parse_pam_args(argc, argv);
+    let (cipher_arg, _mount_arg, _) = parse_pam_args(argc, argv);
     let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(pwd, cipher_arg.as_deref(), None);
 
     // Ensure cipherdir has gocryptfs.conf
