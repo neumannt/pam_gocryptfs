@@ -375,8 +375,6 @@ unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CS
         }
     };
 
-    // Double-fork: parent waits for first child; first child spawns grandchild and exits;
-    // grandchild execs gocryptfs in foreground, fully detached from PAM.
     let pid1 = fork();
     if pid1 < 0 {
         syslog_err("pam_gocryptfs: fork() failed");
@@ -385,7 +383,7 @@ unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CS
         return;
     }
     if pid1 == 0 {
-        // Grandchild: run as the user
+        // Child: run as the user
         seteuid(oeuid);
         clearenv();
         if setgroups(1, &(*pwd).pw_gid as *const gid_t) < 0 || setgid((*pwd).pw_gid) < 0 {
@@ -425,7 +423,7 @@ unsafe fn mount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, cipherdir: &CS
 }
 
 unsafe fn unmount_gocryptfs_as_user(pwd: *mut passwd, oeuid: uid_t, mountpoint: &CStr) {
-    // Double-fork and exec fusermount3 -u mountpoint (fallback to fusermount, then umount)
+    // fork and exec fusermount3 -u mountpoint (fallback to fusermount, then umount)
     let pid1 = fork();
     if pid1 < 0 {
         syslog_err("pam_gocryptfs: fork() failed (unmount)");
