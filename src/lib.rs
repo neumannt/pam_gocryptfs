@@ -31,8 +31,10 @@
 use libc::{c_char, c_int, c_long, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, S_IFDIR};
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::marker::PhantomData;
 use std::mem::zeroed;
 use std::os::fd::RawFd;
+use std::pin::Pin;
 use std::ptr::{null, null_mut};
 
 // PAM constants
@@ -77,7 +79,7 @@ extern "C" {
 
     // libc/sys
     fn syslog(prio: c_int, fmt: *const c_char, ...) -> c_int;
-    fn getpwnam(name: *const c_char) -> *mut passwd;
+    fn getpwnam_r(name: *const c_char, pwd: *mut passwd, buf: *mut c_char, buflen: size_t, result: *mut *mut passwd) -> c_int;
     fn sysconf(name: c_int) -> c_long;
 
     fn geteuid() -> uid_t;
@@ -104,9 +106,7 @@ extern "C" {
     fn close(fd: c_int) -> c_int;
 }
 
-fn unique_data_key() -> &'static CStr {
-    c"pam_gocryptfs.authtok"
-}
+const UNIQUE_DATA_KEY: &CStr = c"pam_gocryptfs.authtok";
 
 unsafe extern "C" fn cleanup_password(_pamh: *mut pam_handle_t, data: *mut c_void, _err: c_int) {
     if data.is_null() {
@@ -125,7 +125,7 @@ fn store_password(pamh: *mut pam_handle_t, pass: &CStr) -> c_int {
         if pw_owned.is_null() {
             return PAM_SUCCESS;
         }
-        let rc = pam_set_data(pamh, unique_data_key().as_ptr(), pw_owned as *mut c_void, Some(cleanup_password));
+        let rc = pam_set_data(pamh, UNIQUE_DATA_KEY.as_ptr(), pw_owned as *mut c_void, Some(cleanup_password));
         if rc != PAM_SUCCESS {
             // If set_data failed, wipe+free immediately to avoid leaks
             cleanup_password(pamh, pw_owned as *mut c_void, rc);
@@ -162,30 +162,50 @@ fn syslog_debug(msg: &str) {
     }
 }
 
-struct PasswordInfo {
-    name: &'static CStr,
-    dir: &'static CStr,
-    uid: uid_t,
-    gid: gid_t,
+// A wrapper around pam_handle_t to control the lifetime of the handle.
+struct PamHandle {
+    handle: *mut pam_handle_t,
 }
 
-fn fetch_pwd(pamh: *mut pam_handle_t) -> Option<PasswordInfo> {
+impl PamHandle {
+    fn new(pamh: *mut pam_handle_t) -> Self {
+        Self { handle: pamh }
+    }
+}
+
+// Password info retrieved from passwd database.
+struct PasswordInfo<'a> {
+    _buffer: Pin<Box<[c_char]>>,
+    name: &'a CStr,
+    dir: &'a CStr,
+    uid: uid_t,
+    gid: gid_t,
+    _marker: PhantomData<&'a [c_char]>,
+}
+
+fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo<'_>> {
     unsafe {
         let mut username_ptr: *const c_char = null();
-        let rc = pam_get_user(pamh, &mut username_ptr, null());
+        let rc = pam_get_user(pam.handle, &mut username_ptr, null());
         if rc != PAM_SUCCESS || username_ptr.is_null() {
             syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error getting user; rc = [%d]\n").as_ptr(), rc);
             return None;
         }
-        let pwd = getpwnam(username_ptr);
-        if pwd.is_null() {
+        let mut buf = Pin::new(vec![0 as c_char; libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) as usize].into_boxed_slice());
+        let mut pwd: passwd = zeroed();
+        let mut pwd_ptr: *mut passwd = zeroed();
+        let r = getpwnam_r(username_ptr, &mut pwd as *mut passwd, buf.as_mut().as_mut_ptr(), buf.len(), &mut pwd_ptr);
+        if r != 0 || !std::ptr::eq(pwd_ptr, &pwd) {
             syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n").as_ptr());
+            return None;
         }
         Some(PasswordInfo {
-            name: CStr::from_ptr((*pwd).pw_name),
-            dir: CStr::from_ptr((*pwd).pw_dir),
-            uid: (*pwd).pw_uid,
-            gid: (*pwd).pw_gid,
+            _buffer: buf,
+            name: CStr::from_ptr(pwd.pw_name),
+            dir: CStr::from_ptr(pwd.pw_dir),
+            uid: pwd.pw_uid,
+            gid: pwd.pw_gid,
+            _marker: PhantomData,
         })
     }
 }
@@ -227,7 +247,7 @@ fn mounts_contains(mountpoint: &str) -> bool {
     false
 }
 
-// expand a variable that occured in a path specifier
+// expand a variable that occurred in a path specifier
 fn map_var(pwd: &PasswordInfo, name: &str) -> String {
     match name {
         "USER" => pwd.name.to_string_lossy().to_string(),
@@ -427,7 +447,7 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &CStr, m
         }
         if pid1 == 0 {
             // Child: run as the user
-            impersonate_user_after_fork(&pwd, oeuid);
+            impersonate_user_after_fork(pwd, oeuid);
 
             // Close write end in grandchild right before exec (reader remains open)
             close(write_fd);
@@ -474,7 +494,7 @@ fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr
             return;
         }
         if pid1 == 0 {
-            impersonate_user_after_fork(&pwd, oeuid);
+            impersonate_user_after_fork(pwd, oeuid);
 
             let fusermount3 = cstr("/bin/fusermount3");
             let fusermount = cstr("/bin/fusermount");
@@ -504,7 +524,8 @@ fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr
 
 #[no_mangle]
 pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
-    let pwd = fetch_pwd(pamh);
+    let pam = PamHandle::new(pamh);
+    let pwd = fetch_pwd(&pam);
     let pwd = if let Some(pwd) = pwd {
         pwd
     } else {
@@ -545,7 +566,8 @@ pub extern "C" fn pam_sm_setcred(_pamh: *mut pam_handle_t, _flags: c_int, _argc:
 
 #[no_mangle]
 pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
-    let pwd = fetch_pwd(pamh);
+    let pam = PamHandle::new(pamh);
+    let pwd = fetch_pwd(&pam);
     let pwd = if let Some(pwd) = pwd {
         pwd
     } else {
@@ -592,7 +614,7 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
 
         // Obtain passphrase
         let mut pass_ptr: *const c_void = zeroed();
-        let rc = pam_get_data(pamh, unique_data_key().as_ptr(), &mut pass_ptr);
+        let rc = pam_get_data(pamh, UNIQUE_DATA_KEY.as_ptr(), &mut pass_ptr);
         if rc != PAM_SUCCESS {
             syslog_warn("pam_gocryptfs: unable to retrieve passphrase; skipping mount");
             restore_privs();
@@ -612,7 +634,8 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
 
 #[no_mangle]
 pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
-    let pwd = fetch_pwd(pamh);
+    let pam = PamHandle::new(pamh);
+    let pwd = fetch_pwd(&pam);
     let pwd = if let Some(pwd) = pwd {
         pwd
     } else {
@@ -668,7 +691,8 @@ pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, a
 #[no_mangle]
 pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     // Fetch user
-    let pwd = fetch_pwd(pamh);
+    let pam = PamHandle::new(pamh);
+    let pwd = fetch_pwd(&pam);
     let pwd = if let Some(pwd) = pwd {
         pwd
     } else {
