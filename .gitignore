@@ -1,2 +1,9 @@
 /Cargo.lock
 /target
+/debian/.debhelper
+/debian/debhelper-build-stamp
+/debian/pam-gocryptfs
+/debian/files
+/debian/pam-gocryptfs.debhelper.log
+/debian/pam-gocryptfs.substvars
+/debian/tmp

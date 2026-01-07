@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+DEB_BUILD_ARCH     ?= $(shell dpkg-architecture -qDEB_BUILD_ARCH)
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+
+%:
+	dh ${@} --with cargo
+
+override_dh_auto_build:
+	cargo build --release
+
+override_dh_auto_install:
+	mkdir -p debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/security
+	cp target/release/libpam_gocryptfs.so debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/security/pam_gocryptfs.so
+
+	dh_auto_install
+
+	install -D -m 0644 debian/local/pam-gocryptfs.pam-auth-update debian/pam-gocryptfs/usr/share/pam-configs/pam-gocryptfs
+
+.PHONY: override_dh_auto_build \
+	override_dh_auto_install

@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: pam_gocryptfs
+Upstream-Contact: ecryptfs@vger.kernel.org
+Source: https://launchpad.net/ecryptfs/+download
+
+Files: *
+Copyright: 2026 Thomas Neumann
+License: MIT

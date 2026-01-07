@@ -36,6 +36,14 @@ cargo build --release
 
 ## Install the PAM module
 
+The easiest way is to just build a Debian package and install that, it will setup PAM, too:
+
+```bash
+dpkg-buildpackage -us -uc -i -I
+dpkg -i ../pam-gocryptfs_0.1_amd64.deb
+```
+
+Manual installation requires placing the shared library in the correct folder and setting up PAM.
 On Debian/Ubuntu, PAM modules live under a multiarch-specific security directory (e.g., `/lib/x86_64-linux-gnu/security`). The following commands detect that directory and install the module:
 
 ```bash

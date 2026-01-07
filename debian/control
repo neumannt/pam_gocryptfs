@@ -1,0 +1,19 @@
+Source: pam-gocryptfs
+Section: misc
+Priority: optional
+Maintainer: Thomas Neumann <>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo, rustc, libpam-dev
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/neumannt/pam_gocryptfs
+
+Package: pam-gocryptfs
+Section: misc
+Architecture: linux-any
+Depends:
+ ${misc:Depends}, ${shlibs:Depends},
+ libpam-runtime
+Description: PAM module that automatically mounts a gocryptfs director
+ on login.
