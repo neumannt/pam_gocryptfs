@@ -210,6 +210,47 @@ fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo<'_>> {
     }
 }
 
+// A helper to drop privileges
+struct Privileges {
+    oeuid: uid_t,
+    oegid: gid_t,
+    groups: Vec<gid_t>,
+}
+
+impl Privileges {
+    // Collect provileges to drop then restore them later.
+    fn new() -> Privileges {
+        unsafe {
+            let oeuid = geteuid();
+            let oegid = getegid();
+            let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
+            let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
+            let mut groups: Vec<gid_t> = vec![0; max_groups];
+            let mut ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
+            if ngids < 0 {
+                ngids = 0;
+            }
+            groups.truncate(ngids as usize);
+
+            Privileges { oeuid, oegid, groups }
+        }
+    }
+    // Drop privileges
+    fn drop_privileges(&self, uid: uid_t, gid: gid_t) -> bool {
+        unsafe { setegid(gid) >= 0 && setgroups(1, &gid as *const gid_t) >= 0 && seteuid(uid) >= 0 }
+    }
+    // Restore privileges to the state before drop_privileges() was called.
+    fn restore_privileges(&self) {
+        unsafe {
+            let _ = seteuid(self.oeuid);
+            let _ = setegid(self.oegid);
+            if !self.groups.is_empty() {
+                let _ = setgroups(self.groups.len() as c_int, self.groups.as_ptr());
+            }
+        }
+    }
+}
+
 fn file_exists(path: &CStr) -> bool {
     unsafe {
         let mut s: libc::stat = zeroed();
@@ -590,25 +631,12 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
 
     unsafe {
         // Temporarily drop to user for mounting
-        let oeuid = geteuid();
-        let oegid = getegid();
+        let privs = Privileges::new();
 
-        let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
-        let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
-        let mut groups: Vec<gid_t> = vec![0; max_groups];
-        let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
-        let restore_privs = || {
-            seteuid(oeuid);
-            setegid(oegid);
-            if ngids > 0 {
-                let _ = setgroups(ngids, groups.as_ptr());
-            }
-        };
-
-        if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
+        if !privs.drop_privileges(pwd.uid, pwd.gid) {
             syslog_err("pam_gocryptfs: failed to drop privileges");
             // Attempt to restore anyway
-            restore_privs();
+            privs.restore_privileges();
             return PAM_SUCCESS;
         }
 
@@ -617,16 +645,16 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
         let rc = pam_get_data(pamh, UNIQUE_DATA_KEY.as_ptr(), &mut pass_ptr);
         if rc != PAM_SUCCESS {
             syslog_warn("pam_gocryptfs: unable to retrieve passphrase; skipping mount");
-            restore_privs();
+            privs.restore_privileges();
             return PAM_SUCCESS;
         }
         let pass = CStr::from_ptr(pass_ptr as *const c_char);
 
         // Mount
-        mount_gocryptfs_as_user(&pwd, oeuid, &cipherdir, &mountpoint, pass, allow_other);
+        mount_gocryptfs_as_user(&pwd, privs.oeuid, &cipherdir, &mountpoint, pass, allow_other);
 
         // Restore privileges
-        restore_privs();
+        privs.restore_privileges()
     }
 
     PAM_SUCCESS
@@ -655,35 +683,20 @@ pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, a
         return PAM_SUCCESS;
     }
 
-    unsafe {
-        // Drop to user and unmount
-        let oeuid = geteuid();
-        let oegid = getegid();
+    // Drop to user and unmount
+    let privs = Privileges::new();
 
-        let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
-        let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
-        let mut groups: Vec<gid_t> = vec![0; max_groups];
-        let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
-        let restore_privs = || {
-            seteuid(oeuid);
-            setegid(oegid);
-            if ngids > 0 {
-                let _ = setgroups(ngids, groups.as_ptr());
-            }
-        };
-
-        if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
-            syslog_err("pam_gocryptfs: failed to drop privileges (umount)");
-            // Attempt to restore anyway
-            restore_privs();
-            return PAM_SUCCESS;
-        }
-
-        unmount_gocryptfs_as_user(&pwd, oeuid, &mountpoint);
-
-        // Restore
-        restore_privs();
+    if !privs.drop_privileges(pwd.uid, pwd.gid) {
+        syslog_err("pam_gocryptfs: failed to drop privileges (umount)");
+        // Attempt to restore anyway
+        privs.restore_privileges();
+        return PAM_SUCCESS;
     }
+
+    unmount_gocryptfs_as_user(&pwd, privs.oeuid, &mountpoint);
+
+    // Restore
+    privs.restore_privileges();
 
     PAM_SUCCESS
 }
@@ -754,26 +767,13 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         let stdin_wr = stdin_fds[1];
 
         // Drop privileges to the user for the exec
-        let oeuid = geteuid();
-        let oegid = getegid();
-        let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
-        let max_groups = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
-        let mut groups: Vec<gid_t> = vec![0; max_groups];
-        let ngids = getgroups(groups.len() as c_int, groups.as_mut_ptr());
+        let privs = Privileges::new();
 
-        let restore_privs = || {
-            let _ = seteuid(oeuid);
-            let _ = setegid(oegid);
-            if ngids > 0 {
-                let _ = setgroups(ngids, groups.as_ptr());
-            }
-        };
-
-        if setegid(pwd.gid) < 0 || setgroups(1, &pwd.gid as *const gid_t) < 0 || seteuid(pwd.uid) < 0 {
+        if !privs.drop_privileges(pwd.uid, pwd.gid) {
             syslog_err("pam_gocryptfs: failed to drop privileges for password change");
             close(stdin_rd);
             close(stdin_wr);
-            restore_privs();
+            privs.restore_privileges();
             return PAM_SUCCESS;
         }
 
@@ -784,13 +784,13 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
             syslog_err("pam_gocryptfs: fork() failed for password change");
             close(stdin_rd);
             close(stdin_wr);
-            restore_privs();
+            privs.restore_privileges();
             return PAM_SUCCESS;
         }
 
         if pid == 0 {
             // Child
-            impersonate_user_after_fork(&pwd, oeuid);
+            impersonate_user_after_fork(&pwd, privs.oeuid);
 
             // Close write ends in child; we will only read
             close(stdin_wr);
@@ -837,7 +837,7 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         let _ = waitpid(pid, &mut _st, 0);
 
         // Restore privileges
-        restore_privs();
+        privs.restore_privileges();
     }
 
     PAM_SUCCESS
