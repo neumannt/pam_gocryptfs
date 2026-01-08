@@ -9,7 +9,7 @@
 // - pam_sm_close_session: unmount gocryptfs
 //
 // Defaults
-// - Cipher directory: ~/.gocryptfs
+// - Cipher directory: ~/.gocryptfs/gocryptfs
 // - Mount point:      ~/Private
 // - Auto toggles:     ~/.gocryptfs/auto-mount and ~/.gocryptfs/auto-umount
 //
@@ -51,6 +51,7 @@ const DEFAULT_MOUNT_DIR_NAME: &str = "Private";
 const DEFAULT_GCRYPTFS_BIN: &str = "/usr/bin/gocryptfs";
 const AUTO_MOUNT_FILE: &str = "auto-mount";
 const AUTO_UMOUNT_FILE: &str = "auto-umount";
+const GOCRYPTFS_DIR: &str = "gocryptfs";
 const GOCONF_FILE: &str = "gocryptfs.conf";
 
 #[repr(C)]
@@ -258,6 +259,11 @@ fn file_exists(path: &CStr) -> bool {
     }
 }
 
+fn toggle_exists(path: &CStr, file: &str) -> bool {
+    let toggle_path = CString::new(format!("{}/{}", path.to_string_lossy(), file)).unwrap();
+    file_exists(&toggle_path)
+}
+
 fn ensure_dir(path: &CStr, mode: mode_t) -> bool {
     unsafe {
         let mut s: libc::stat = zeroed();
@@ -334,14 +340,13 @@ fn expand_vars(pwd: &PasswordInfo, s: String) -> String {
     result
 }
 
-fn build_default_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString, CString) {
+fn build_default_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString) {
     let home = pwd.dir;
     let home_str = home.to_string_lossy();
-    let cipherdir = cipher_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
+    let config_dir = cipher_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
+    let cipher_dir = format!("{}/{}", config_dir, GOCRYPTFS_DIR);
     let mountpoint = mount_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
-    let auto_mount = format!("{}.{}", cipherdir, AUTO_MOUNT_FILE);
-    let auto_umount = format!("{}.{}", cipherdir, AUTO_UMOUNT_FILE);
-    (CString::new(cipherdir).unwrap(), CString::new(mountpoint).unwrap(), CString::new(auto_mount).unwrap(), CString::new(auto_umount).unwrap())
+    (CString::new(cipher_dir).unwrap(), CString::new(mountpoint).unwrap(), CString::new(config_dir).unwrap())
 }
 
 fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, Option<String>, bool) {
@@ -575,10 +580,10 @@ pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, ar
 
     // Parse args and compute paths
     let (cipher_arg, mount_arg, _) = parse_pam_args(argc, argv);
-    let (_cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (_cipher_dir, mountpoint, config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-mount toggle
-    if !file_exists(&auto_mount) {
+    if !toggle_exists(&config_dir, AUTO_MOUNT_FILE) {
         syslog_debug("pam_gocryptfs: auto-mount not enabled, skipping");
         return PAM_SUCCESS;
     }
@@ -617,10 +622,10 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
 
     // Parse args and compute paths
     let (cipher_arg, mount_arg, allow_other) = parse_pam_args(argc, argv);
-    let (cipherdir, mountpoint, auto_mount, _auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (cipher_dir, mountpoint, config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-mount toggle
-    if !file_exists(&auto_mount) {
+    if !toggle_exists(&config_dir, AUTO_MOUNT_FILE) {
         return PAM_SUCCESS;
     }
 
@@ -651,7 +656,7 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
         let pass = CStr::from_ptr(pass_ptr as *const c_char);
 
         // Mount
-        mount_gocryptfs_as_user(&pwd, privs.oeuid, &cipherdir, &mountpoint, pass, allow_other);
+        mount_gocryptfs_as_user(&pwd, privs.oeuid, &cipher_dir, &mountpoint, pass, allow_other);
 
         // Restore privileges
         privs.restore_privileges()
@@ -670,10 +675,10 @@ pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, a
         return PAM_SUCCESS;
     };
     let (cipher_arg, mount_arg, _) = parse_pam_args(argc, argv);
-    let (_cipherdir, mountpoint, _auto_mount, auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let (_cipher_dir, mountpoint, config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
     // Honor per-user ~/.gocryptfs/auto-umount toggle
-    if !file_exists(&auto_umount) {
+    if !toggle_exists(&config_dir, AUTO_UMOUNT_FILE) {
         syslog_debug("pam_gocryptfs: auto-umount not enabled, skipping");
         return PAM_SUCCESS;
     }
@@ -747,10 +752,10 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
 
         // Determine cipherdir (ignore mountpoint here)
         let (cipher_arg, _mount_arg, _) = parse_pam_args(argc, argv);
-        let (cipherdir, _mountpoint, _auto_mount, _auto_umount) = build_default_paths(&pwd, cipher_arg.as_deref(), None);
+        let (cipher_dir, _mountpoint, _config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), None);
 
         // Ensure cipherdir has gocryptfs.conf
-        let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
+        let conf_path = CString::new(format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE)).unwrap();
         if !file_exists(&conf_path) {
             syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping password change");
             return PAM_SUCCESS;
@@ -807,7 +812,7 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
             let a_nosyslog = cstr("-nosyslog");
             let a_passwd = cstr("-passwd");
 
-            execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), cipherdir.as_ptr(), null::<c_char>());
+            execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), cipher_dir.as_ptr(), null::<c_char>());
             // If we get here, exec failed
             libc::_exit(1);
         }
