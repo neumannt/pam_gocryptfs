@@ -31,6 +31,7 @@
 use libc::{c_char, c_int, c_long, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, S_IFDIR};
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::io::BufRead;
 use std::marker::PhantomData;
 use std::mem::zeroed;
 use std::os::fd::RawFd;
@@ -51,7 +52,7 @@ const DEFAULT_MOUNT_DIR_NAME: &str = "Private";
 const DEFAULT_GCRYPTFS_BIN: &str = "/usr/bin/gocryptfs";
 const AUTO_MOUNT_FILE: &str = "auto-mount";
 const AUTO_UMOUNT_FILE: &str = "auto-umount";
-const ALLOW_OTHER_FILE: &str = "allow-other";
+const OPTIONS_FILE: &str = "mount-options";
 const GOCRYPTFS_DIR: &str = "gocryptfs";
 const GOCONF_FILE: &str = "gocryptfs.conf";
 
@@ -457,9 +458,23 @@ fn impersonate_user_after_fork(pwd: &PasswordInfo, oeuid: uid_t) {
     }
 }
 
-fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &CStr, mountpoint: &CStr, pass: &CStr, allow_other: bool) {
+fn read_mount_options(filename: &str, options: &mut Vec<CString>) {
+    use std::fs::File;
+    use std::io::BufReader;
+    if let Ok(file) = File::open(filename) {
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim();
+            if line.starts_with('-') && !line.contains('\0') && line!="-f" && line!="-fg" {
+                options.push(CString::new(line).unwrap());
+            }
+        }
+    }
+}
+
+fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, cipher_dir: &CStr, mountpoint: &CStr, pass: &CStr) {
     // Ensure cipherdir has a config file
-    let conf_path = CString::new(format!("{}/{}", cipherdir.to_string_lossy(), GOCONF_FILE)).unwrap();
+    let conf_path = CString::new(format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE)).unwrap();
     if !file_exists(&conf_path) {
         syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping mount");
         return;
@@ -502,12 +517,10 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipherdir: &CStr, m
             // Prepare the arguments
             let bin = cstr(DEFAULT_GCRYPTFS_BIN);
             let mut args: Vec<CString> = vec![cstr("gocryptfs"), cstr("-q"), cstr("-passfile"), passfile_arg];
-            if allow_other {
-                args.push(cstr("-allow_other"));
-            }
+            read_mount_options(&format!("{}/{}", config_dir.to_string_lossy(), OPTIONS_FILE), &mut args);
 
             let mut argv: Vec<*const c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
-            argv.push(cipherdir.as_ptr());
+            argv.push(cipher_dir.as_ptr());
             argv.push(mountpoint.as_ptr());
             argv.push(std::ptr::null());
 
@@ -654,7 +667,7 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
         let pass = CStr::from_ptr(pass_ptr as *const c_char);
 
         // Mount
-        mount_gocryptfs_as_user(&pwd, privs.oeuid, &cipher_dir, &mountpoint, pass, toggle_exists(&config_dir, ALLOW_OTHER_FILE));
+        mount_gocryptfs_as_user(&pwd, privs.oeuid, &config_dir, &cipher_dir, &mountpoint, pass);
 
         // Restore privileges
         privs.restore_privileges()
