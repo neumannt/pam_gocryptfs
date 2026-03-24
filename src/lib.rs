@@ -194,7 +194,11 @@ fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo<'_>> {
             syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error getting user; rc = [%d]\n").as_ptr(), rc);
             return None;
         }
-        let mut buf = Pin::new(vec![0 as c_char; libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) as usize].into_boxed_slice());
+        let buflen = match sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
+            n if n > 0 => n as usize,
+            _ => 16384,
+        };
+        let mut buf = Pin::new(vec![0 as c_char; buflen].into_boxed_slice());
         let mut pwd: passwd = zeroed();
         let mut pwd_ptr: *mut passwd = zeroed();
         let r = getpwnam_r(username_ptr, &mut pwd as *mut passwd, buf.as_mut().as_mut_ptr(), buf.len(), &mut pwd_ptr);
@@ -465,7 +469,7 @@ fn read_mount_options(filename: &str, options: &mut Vec<CString>) {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(Result::ok) {
             let line = line.trim();
-            if line.starts_with('-') && !line.contains('\0') && line!="-f" && line!="-fg" {
+            if line.starts_with('-') && !line.contains('\0') && line != "-f" && line != "-fg" {
                 options.push(CString::new(line).unwrap());
             }
         }
