@@ -42,6 +42,7 @@ const PAM_AUTHTOK_RECOVERY_ERR: c_int = 21;
 const PAM_AUTHTOK: c_int = 6;
 const PAM_OLDAUTHTOK: c_int = 7;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
+const PAM_BUF_ERR: c_int = 5;
 const PAM_PRELIM_CHECK: c_int = 0x4000;
 
 // Defaults
@@ -124,7 +125,8 @@ fn store_password(pamh: *mut pam_handle_t, pass: &CStr) -> c_int {
     unsafe {
         let pw_owned = libc::strdup(pass.as_ptr());
         if pw_owned.is_null() {
-            return PAM_SUCCESS;
+            syslog_err("pam_gocryptfs: strdup failed (out of memory)");
+            return PAM_BUF_ERR;
         }
         let rc = pam_set_data(pamh, UNIQUE_DATA_KEY.as_ptr(), pw_owned as *mut c_void, Some(cleanup_password));
         if rc != PAM_SUCCESS {
@@ -432,7 +434,12 @@ fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
         buf.extend_from_slice(pass);
         buf.push(b'\n');
         let wrote = write(write_fd, buf.as_ptr() as *const c_void, buf.len());
-        if wrote < 0 || wrote as usize != buf.len() {
+        // Zero password buffer before dropping
+        for b in buf.iter_mut() {
+            std::ptr::write_volatile(b, 0);
+        }
+        drop(buf);
+        if wrote < 0 || wrote as usize != (pass.len() + 1) {
             close(read_fd);
             close(write_fd);
             return None;
@@ -840,8 +847,14 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         buf.extend_from_slice(new_c.to_bytes());
         buf.push(b'\n');
 
-        let wrote = write(stdin_wr, buf.as_ptr() as *const c_void, buf.len());
-        if wrote < 0 || wrote as usize != buf.len() {
+        let buf_len = buf.len();
+        let wrote = write(stdin_wr, buf.as_ptr() as *const c_void, buf_len);
+        // Zero password buffer before dropping
+        for b in buf.iter_mut() {
+            std::ptr::write_volatile(b, 0);
+        }
+        drop(buf);
+        if wrote < 0 || wrote as usize != buf_len {
             syslog_err("pam_gocryptfs: Failed to write new password to stdin");
         }
         close(stdin_wr);
