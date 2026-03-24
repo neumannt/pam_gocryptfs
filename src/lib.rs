@@ -481,8 +481,9 @@ fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
 // Become the mounting user in a child process
 fn impersonate_user_after_fork(pwd: &PasswordInfo, oeuid: uid_t) {
     unsafe {
-        seteuid(oeuid);
-        clearenv();
+        if seteuid(oeuid) < 0 || clearenv() != 0 {
+            libc::_exit(1);
+        }
         if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
             libc::_exit(1);
         }
