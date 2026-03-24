@@ -108,6 +108,32 @@ extern "C" {
     fn close(fd: c_int) -> c_int;
 }
 
+// A CString wrapper that zeroes its memory before freeing.
+struct PwdString(CString);
+
+impl PwdString {
+    fn new(s: CString) -> Self {
+        Self(s)
+    }
+}
+
+impl std::ops::Deref for PwdString {
+    type Target = CStr;
+    fn deref(&self) -> &CStr {
+        &self.0
+    }
+}
+
+impl Drop for PwdString {
+    fn drop(&mut self) {
+        let bytes = self.0.as_bytes_with_nul();
+        // write_volatile prevents the compiler from eliding the zeroing
+        for i in 0..bytes.len() {
+            unsafe { std::ptr::write_volatile((bytes.as_ptr() as *mut u8).add(i), 0) };
+        }
+    }
+}
+
 const UNIQUE_DATA_KEY: &CStr = c"pam_gocryptfs.authtok";
 
 unsafe extern "C" fn cleanup_password(_pamh: *mut pam_handle_t, data: *mut c_void, _err: c_int) {
@@ -373,7 +399,7 @@ fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, O
     (cipherdir, mountpoint)
 }
 
-fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<CString> {
+fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<PwdString> {
     unsafe {
         // First try to get PAM_AUTHTOK
         let mut item: *const c_void = null();
@@ -381,7 +407,7 @@ fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<CString> {
         if rc == PAM_SUCCESS && !item.is_null() {
             let pass = CStr::from_ptr(item as *const c_char).to_bytes();
             if !pass.is_empty() {
-                return CString::new(pass).ok();
+                return CString::new(pass).ok().map(PwdString::new);
             }
         }
         // Fall back to prompting
@@ -390,8 +416,11 @@ fn prompt_or_get_password(pamh: *mut pam_handle_t) -> Option<CString> {
         let prc = pam_prompt(pamh, PAM_PROMPT_ECHO_OFF, &mut resp, prompt.as_ptr());
         if prc == PAM_SUCCESS && !resp.is_null() {
             let out = CStr::from_ptr(resp).to_bytes();
-            let s = CString::new(out).ok();
-            // pam alloc for resp is managed by PAM; do not free here.
+            let s = CString::new(out).ok().map(PwdString::new);
+            // Zero and free the PAM-allocated response
+            let len = libc::strlen(resp);
+            libc::memset(resp as *mut c_void, 0, len);
+            libc::free(resp as *mut c_void);
             return s;
         }
         None
