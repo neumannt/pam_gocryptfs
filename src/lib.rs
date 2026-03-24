@@ -32,10 +32,8 @@ use libc::{c_char, c_int, c_long, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::BufRead;
-use std::marker::PhantomData;
 use std::mem::zeroed;
 use std::os::fd::RawFd;
-use std::pin::Pin;
 use std::ptr::{null, null_mut};
 
 // PAM constants
@@ -177,16 +175,14 @@ impl PamHandle {
 }
 
 // Password info retrieved from passwd database.
-struct PasswordInfo<'a> {
-    _buffer: Pin<Box<[c_char]>>,
-    name: &'a CStr,
-    dir: &'a CStr,
+struct PasswordInfo {
+    name: CString,
+    dir: CString,
     uid: uid_t,
     gid: gid_t,
-    _marker: PhantomData<&'a [c_char]>,
 }
 
-fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo<'_>> {
+fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo> {
     unsafe {
         let mut username_ptr: *const c_char = null();
         let rc = pam_get_user(pam.handle, &mut username_ptr, null());
@@ -198,21 +194,19 @@ fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo<'_>> {
             n if n > 0 => n as usize,
             _ => 16384,
         };
-        let mut buf = Pin::new(vec![0 as c_char; buflen].into_boxed_slice());
+        let mut buf = vec![0 as c_char; buflen];
         let mut pwd: passwd = zeroed();
         let mut pwd_ptr: *mut passwd = zeroed();
-        let r = getpwnam_r(username_ptr, &mut pwd as *mut passwd, buf.as_mut().as_mut_ptr(), buf.len(), &mut pwd_ptr);
+        let r = getpwnam_r(username_ptr, &mut pwd as *mut passwd, buf.as_mut_ptr(), buf.len(), &mut pwd_ptr);
         if r != 0 || !std::ptr::eq(pwd_ptr, &pwd) {
             syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n").as_ptr());
             return None;
         }
         Some(PasswordInfo {
-            _buffer: buf,
-            name: CStr::from_ptr(pwd.pw_name),
-            dir: CStr::from_ptr(pwd.pw_dir),
+            name: CStr::from_ptr(pwd.pw_name).to_owned(),
+            dir: CStr::from_ptr(pwd.pw_dir).to_owned(),
             uid: pwd.pw_uid,
             gid: pwd.pw_gid,
-            _marker: PhantomData,
         })
     }
 }
@@ -347,7 +341,7 @@ fn expand_vars(pwd: &PasswordInfo, s: String) -> String {
 }
 
 fn build_default_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString) {
-    let home = pwd.dir;
+    let home = &pwd.dir;
     let home_str = home.to_string_lossy();
     let config_dir = cipher_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
     let cipher_dir = format!("{}/{}", config_dir, GOCRYPTFS_DIR);
