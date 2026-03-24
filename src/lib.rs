@@ -164,7 +164,11 @@ fn store_password(pamh: *mut pam_handle_t, pass: &CStr) -> c_int {
 }
 
 fn cstr(s: &str) -> CString {
-    CString::new(s).unwrap()
+    let bytes = match s.find('\0') {
+        Some(pos) => &s.as_bytes()[..pos],
+        None => s.as_bytes(),
+    };
+    CString::new(bytes).unwrap()
 }
 
 fn syslog_err(msg: &str) {
@@ -288,7 +292,7 @@ fn file_exists(path: &CStr) -> bool {
 }
 
 fn toggle_exists(path: &CStr, file: &str) -> bool {
-    let toggle_path = CString::new(format!("{}/{}", path.to_string_lossy(), file)).unwrap();
+    let toggle_path = cstr(&format!("{}/{}", path.to_string_lossy(), file));
     file_exists(&toggle_path)
 }
 
@@ -374,7 +378,7 @@ fn build_default_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: 
     let config_dir = cipher_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
     let cipher_dir = format!("{}/{}", config_dir, GOCRYPTFS_DIR);
     let mountpoint = mount_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
-    (CString::new(cipher_dir).unwrap(), CString::new(mountpoint).unwrap(), CString::new(config_dir).unwrap())
+    (cstr(&cipher_dir), cstr(&mountpoint), cstr(&config_dir))
 }
 
 fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, Option<String>) {
@@ -501,7 +505,7 @@ fn read_mount_options(filename: &str, options: &mut Vec<CString>) {
         for line in reader.lines().map_while(Result::ok) {
             let line = line.trim();
             if line.starts_with('-') && !line.contains('\0') && line != "-f" && line != "-fg" {
-                options.push(CString::new(line).unwrap());
+                options.push(cstr(line));
             }
         }
     }
@@ -509,7 +513,7 @@ fn read_mount_options(filename: &str, options: &mut Vec<CString>) {
 
 fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, cipher_dir: &CStr, mountpoint: &CStr, pass: &CStr) {
     // Ensure cipherdir has a config file
-    let conf_path = CString::new(format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE)).unwrap();
+    let conf_path = cstr(&format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE));
     if !file_exists(&conf_path) {
         syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping mount");
         return;
@@ -547,7 +551,7 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, 
             close(write_fd);
 
             // Build -passfile /proc/self/fd/<read_fd>
-            let passfile_arg = CString::new(format!("/proc/self/fd/{}", read_fd)).unwrap();
+            let passfile_arg = cstr(&format!("/proc/self/fd/{}", read_fd));
 
             // Prepare the arguments
             let bin = cstr(DEFAULT_GCRYPTFS_BIN);
@@ -801,7 +805,7 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         let (cipher_dir, _mountpoint, _config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), None);
 
         // Ensure cipherdir has gocryptfs.conf
-        let conf_path = CString::new(format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE)).unwrap();
+        let conf_path = cstr(&format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE));
         if !file_exists(&conf_path) {
             syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping password change");
             return PAM_SUCCESS;
