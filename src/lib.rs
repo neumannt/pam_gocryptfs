@@ -80,7 +80,7 @@ extern "C" {
     fn pam_get_data(pamh: *mut pam_handle_t, module_data_name: *const c_char, data: *mut *const c_void) -> c_int;
 
     // libc/sys
-    fn syslog(prio: c_int, fmt: *const c_char, ...) -> c_int;
+    fn syslog(prio: c_int, fmt: *const c_char, ...);
     fn getpwnam_r(name: *const c_char, pwd: *mut passwd, buf: *mut c_char, buflen: size_t, result: *mut *mut passwd) -> c_int;
     fn sysconf(name: c_int) -> c_long;
 
