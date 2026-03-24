@@ -307,7 +307,35 @@ fn ensure_dir(path: &CStr, mode: mode_t) -> bool {
     }
 }
 
+fn normalize_path(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => match parts.last() {
+                Some(&"..") | None if !absolute => parts.push(".."),
+                None => {}
+                _ => {
+                    parts.pop();
+                }
+            },
+            c => parts.push(c),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{}", joined)
+    } else {
+        joined
+    }
+}
+
 fn mounts_contains(mountpoint: &str) -> bool {
+    let needle = normalize_path(mountpoint);
     // Check if mountpoint is a gocryptfs mount (type "fuse.gocryptfs" or "gocryptfs")
     if let Ok(contents) = fs::read_to_string("/proc/self/mounts") {
         for line in contents.lines() {
@@ -317,7 +345,7 @@ fn mounts_contains(mountpoint: &str) -> bool {
             let tgt = it.next();
             let fstype = it.next();
             if let (Some(t), Some(ft)) = (tgt, fstype) {
-                if t == mountpoint && (ft == "fuse.gocryptfs" || ft == "gocryptfs") {
+                if normalize_path(t) == needle && (ft == "fuse.gocryptfs" || ft == "gocryptfs") {
                     return true;
                 }
             }
