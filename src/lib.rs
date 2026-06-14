@@ -101,9 +101,6 @@ extern "C" {
 
     fn fork() -> pid_t;
     fn waitpid(pid: pid_t, status: *mut c_int, options: c_int) -> pid_t;
-    fn execl(path: *const c_char, arg0: *const c_char, ...) -> c_int;
-    fn execv(path: *const c_char, argv: *const *const c_char) -> libc::c_int;
-    fn clearenv() -> c_int;
     fn stat(path: *const c_char, buf: *mut libc::stat) -> c_int;
     fn mkdir(path: *const c_char, mode: mode_t) -> c_int;
 
@@ -498,7 +495,6 @@ fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
         let read_fd = fds[0];
         let write_fd = fds[1];
 
-
         // Write pass + newline
         let mut buf = Vec::with_capacity(pass.len() + 1);
         buf.extend_from_slice(pass);
@@ -522,7 +518,7 @@ fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
 // Become the mounting user in a child process
 fn impersonate_user_after_fork(pwd: &PasswordInfo, oeuid: uid_t) {
     unsafe {
-        if seteuid(oeuid) < 0 || clearenv() != 0 {
+        if seteuid(oeuid) < 0 {
             libc::_exit(1);
         }
         if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
@@ -607,6 +603,18 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, 
         }
     };
 
+    // Assemble everything that allocates before fork(). After fork the child must
+    // touch only async-signal-safe calls, because the host PAM process may be
+    // multi-threaded and malloc/file I/O between fork and exec can deadlock.
+    let bin = cstr(DEFAULT_GCRYPTFS_BIN);
+    let passfile_arg = cstr(&format!("/proc/self/fd/{}", read_fd));
+    let mut args: Vec<CString> = vec![cstr("gocryptfs"), cstr("-q"), cstr("-passfile"), passfile_arg];
+    read_mount_options(&format!("{}/{}", config_dir.to_string_lossy(), OPTIONS_FILE), &mut args);
+    let mut argv: Vec<*const c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+    argv.push(cipher_dir.as_ptr());
+    argv.push(mountpoint.as_ptr());
+    argv.push(null());
+
     unsafe {
         let pid1 = fork();
         if pid1 < 0 {
@@ -629,22 +637,10 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, 
                 libc::fcntl(read_fd, libc::F_SETFD, cur & !libc::FD_CLOEXEC);
             }
 
-            // Build -passfile /proc/self/fd/<read_fd>
-            let passfile_arg = cstr(&format!("/proc/self/fd/{}", read_fd));
-
-            // Prepare the arguments
-            let bin = cstr(DEFAULT_GCRYPTFS_BIN);
-            let mut args: Vec<CString> = vec![cstr("gocryptfs"), cstr("-q"), cstr("-passfile"), passfile_arg];
-            read_mount_options(&format!("{}/{}", config_dir.to_string_lossy(), OPTIONS_FILE), &mut args);
-
-            let mut argv: Vec<*const c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
-            argv.push(cipher_dir.as_ptr());
-            argv.push(mountpoint.as_ptr());
-            argv.push(std::ptr::null());
-
-            // Exec gocryptfs
-            execv(bin.as_ptr(), argv.as_ptr());
-            // If execl returns, it failed
+            // Exec gocryptfs with an empty environment.
+            let envp = [null::<c_char>()];
+            libc::execve(bin.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            // If execve returns, it failed.
             libc::_exit(1);
         }
         // Parent: wait for first child
@@ -661,6 +657,19 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, 
 }
 
 fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr) {
+    // Build all argv vectors before fork
+    // then fusermount, then umount.
+    let fusermount3 = cstr("/bin/fusermount3");
+    let fusermount = cstr("/bin/fusermount");
+    let umount_bin = cstr("/bin/umount");
+    let arg0_fm3 = cstr("fusermount3");
+    let arg0_fm = cstr("fusermount");
+    let arg0_um = cstr("umount");
+    let arg_u = cstr("-u");
+    let argv_fm3 = [arg0_fm3.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null()];
+    let argv_fm = [arg0_fm.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null()];
+    let argv_um = [arg0_um.as_ptr(), mountpoint.as_ptr(), null()];
+
     unsafe {
         // fork and exec fusermount3 -u mountpoint (fallback to fusermount, then umount)
         let pid1 = fork();
@@ -671,20 +680,13 @@ fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr
         if pid1 == 0 {
             impersonate_user_after_fork(pwd, oeuid);
 
-            let fusermount3 = cstr("/bin/fusermount3");
-            let fusermount = cstr("/bin/fusermount");
-            let umount_bin = cstr("/bin/umount");
-            let arg0_fm3 = cstr("fusermount3");
-            let arg0_fm = cstr("fusermount");
-            let arg0_um = cstr("umount");
-            let arg_u = cstr("-u");
-
+            let envp = [null::<c_char>()];
             // Try fusermount3
-            execl(fusermount3.as_ptr(), arg0_fm3.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
+            libc::execve(fusermount3.as_ptr(), argv_fm3.as_ptr(), envp.as_ptr());
             // Try fusermount
-            execl(fusermount.as_ptr(), arg0_fm.as_ptr(), arg_u.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
+            libc::execve(fusermount.as_ptr(), argv_fm.as_ptr(), envp.as_ptr());
             // Try umount
-            execl(umount_bin.as_ptr(), arg0_um.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
+            libc::execve(umount_bin.as_ptr(), argv_um.as_ptr(), envp.as_ptr());
             libc::_exit(1);
         }
         match wait_with_timeout(pid1, HELPER_TIMEOUT_SECS) {
@@ -912,11 +914,18 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
             return PAM_SUCCESS;
         }
 
-        // Fork and exec: gocryptfs -q -nosyslog -passwd <cipherdir>.
-        // gocryptfs reads passwords from stdin when stdin is not a TTY, so we
-        // feed the child the old password followed by the new password twice,
-        // each newline-terminated (this relies on gocryptfs's -passwd stdin
-        // behavior; there is no -passfile here).
+        // Assemble argv before fork
+        // gocryptfs -q -nosyslog -passwd <cipherdir>: it reads passwords from
+        // stdin when stdin is not a TTY, so we feed the child the old password
+        // followed by the new password twice, each newline-terminated (this
+        // relies on gocryptfs's -passwd stdin behavior; there is no -passfile).
+        let bin = cstr(DEFAULT_GCRYPTFS_BIN);
+        let arg0 = cstr("gocryptfs");
+        let a_q = cstr("-q");
+        let a_nosyslog = cstr("-nosyslog");
+        let a_passwd = cstr("-passwd");
+        let argv_pw = [arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), cipher_dir.as_ptr(), null()];
+
         let pid = fork();
         if pid < 0 {
             syslog_err("pam_gocryptfs: fork() failed for password change");
@@ -939,13 +948,8 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
             }
             close(stdin_rd);
 
-            let bin = cstr(DEFAULT_GCRYPTFS_BIN);
-            let arg0 = cstr("gocryptfs");
-            let a_q = cstr("-q");
-            let a_nosyslog = cstr("-nosyslog");
-            let a_passwd = cstr("-passwd");
-
-            execl(bin.as_ptr(), arg0.as_ptr(), a_q.as_ptr(), a_nosyslog.as_ptr(), a_passwd.as_ptr(), cipher_dir.as_ptr(), null::<c_char>());
+            let envp = [null::<c_char>()];
+            libc::execve(bin.as_ptr(), argv_pw.as_ptr(), envp.as_ptr());
             // If we get here, exec failed
             libc::_exit(1);
         }
