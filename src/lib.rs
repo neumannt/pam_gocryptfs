@@ -489,11 +489,6 @@ fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
         let read_fd = fds[0];
         let write_fd = fds[1];
 
-        // We must clear CLOEXEC on read_fd so the exec'ed gocryptfs can access /proc/self/fd/<read_fd>
-        let cur = libc::fcntl(read_fd, libc::F_GETFD);
-        if cur >= 0 {
-            libc::fcntl(read_fd, libc::F_SETFD, cur & !libc::FD_CLOEXEC);
-        }
 
         // Write pass + newline
         let mut buf = Vec::with_capacity(pass.len() + 1);
@@ -611,6 +606,13 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, 
 
             // Close write end in grandchild right before exec (reader remains open)
             close(write_fd);
+
+            // Clear CLOEXEC on read_fd here so the exec'ed
+            // gocryptfs can access /proc/self/fd/<read_fd>.
+            let cur = libc::fcntl(read_fd, libc::F_GETFD);
+            if cur >= 0 {
+                libc::fcntl(read_fd, libc::F_SETFD, cur & !libc::FD_CLOEXEC);
+            }
 
             // Build -passfile /proc/self/fd/<read_fd>
             let passfile_arg = cstr(&format!("/proc/self/fd/{}", read_fd));
