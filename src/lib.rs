@@ -227,24 +227,33 @@ fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo> {
             syslog(libc::LOG_ERR, cstr("pam_gocryptfs: Error getting user; rc = [%d]\n").as_ptr(), rc);
             return None;
         }
-        let buflen = match sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
+        // Handle indeterminate _SC_GETPW_R_SIZE_MAX
+        let mut buflen = match sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
             n if n > 0 => n as usize,
             _ => 16384,
         };
-        let mut buf = vec![0 as c_char; buflen];
-        let mut pwd: passwd = zeroed();
-        let mut pwd_ptr: *mut passwd = zeroed();
-        let r = getpwnam_r(username_ptr, &mut pwd as *mut passwd, buf.as_mut_ptr(), buf.len(), &mut pwd_ptr);
-        if r != 0 || !std::ptr::eq(pwd_ptr, &pwd) {
-            syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n").as_ptr());
-            return None;
+        const MAX_BUFLEN: usize = 1 << 20; // 1 MiB ceiling for the passwd buffer
+        loop {
+            let mut buf = vec![0 as c_char; buflen];
+            let mut pwd: passwd = zeroed();
+            let mut pwd_ptr: *mut passwd = zeroed();
+            let r = getpwnam_r(username_ptr, &mut pwd as *mut passwd, buf.as_mut_ptr(), buf.len(), &mut pwd_ptr);
+            // Buffer too small: grow and retry instead of giving up.
+            if r == libc::ERANGE && buflen < MAX_BUFLEN {
+                buflen = (buflen * 2).min(MAX_BUFLEN);
+                continue;
+            }
+            if r != 0 || !std::ptr::eq(pwd_ptr, &pwd) {
+                syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n").as_ptr());
+                return None;
+            }
+            return Some(PasswordInfo {
+                name: CStr::from_ptr(pwd.pw_name).to_owned(),
+                dir: CStr::from_ptr(pwd.pw_dir).to_owned(),
+                uid: pwd.pw_uid,
+                gid: pwd.pw_gid,
+            });
         }
-        Some(PasswordInfo {
-            name: CStr::from_ptr(pwd.pw_name).to_owned(),
-            dir: CStr::from_ptr(pwd.pw_dir).to_owned(),
-            uid: pwd.pw_uid,
-            gid: pwd.pw_gid,
-        })
     }
 }
 
