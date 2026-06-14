@@ -3,7 +3,7 @@ Default: yes
 Priority: 0
 Auth-Type: Additional
 Auth-Final:
-	required	pam_gocryptfs.so
+	optional	pam_gocryptfs.so
 Session-Type: Additional
 Session-Final:
 	optional	pam_gocryptfs.so

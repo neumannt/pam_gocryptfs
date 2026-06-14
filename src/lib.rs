@@ -38,6 +38,7 @@ use std::ptr::{null, null_mut};
 
 // PAM constants
 const PAM_SUCCESS: c_int = 0;
+const PAM_IGNORE: c_int = 25;
 const PAM_AUTHTOK_RECOVERY_ERR: c_int = 21;
 const PAM_AUTHTOK: c_int = 6;
 const PAM_OLDAUTHTOK: c_int = 7;
@@ -653,7 +654,7 @@ pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, ar
     let pwd = if let Some(pwd) = pwd {
         pwd
     } else {
-        return PAM_SUCCESS;
+        return PAM_IGNORE;
     };
 
     // Parse args and compute paths
@@ -663,13 +664,13 @@ pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, ar
     // Honor per-user ~/.gocryptfs/auto-mount toggle
     if !toggle_exists(&config_dir, AUTO_MOUNT_FILE) {
         syslog_debug("pam_gocryptfs: auto-mount not enabled, skipping");
-        return PAM_SUCCESS;
+        return PAM_IGNORE;
     }
 
     // Already mounted?
     if mounts_contains(&mountpoint.to_string_lossy()) {
         syslog_debug("pam_gocryptfs: mountpoint already mounted, skipping");
-        return PAM_SUCCESS;
+        return PAM_IGNORE;
     }
 
     // Store the pass phrase to make it available in the session
@@ -677,10 +678,12 @@ pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, ar
         Some(p) => p,
         None => {
             syslog_warn("pam_gocryptfs: no passphrase available; skipping mount");
-            return PAM_SUCCESS;
+            return PAM_IGNORE;
         }
     };
-    store_password(pamh, &pass)
+    // We ignore failures when storing the password, as we will simply skip mounting in that case
+    let _ = store_password(pamh, &pass);
+    PAM_IGNORE
 }
 
 #[no_mangle]

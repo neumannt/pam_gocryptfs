@@ -80,7 +80,7 @@ password optional pam_gocryptfs.so
 
 sudoedit /etc/pam.d/common-auth
 # Add near the end:
-auth required pam_gocryptfs.so
+auth optional pam_gocryptfs.so
 ```
 
 Notes:
