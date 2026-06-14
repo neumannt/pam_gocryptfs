@@ -28,7 +28,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::missing_safety_doc)]
 
-use libc::{c_char, c_int, c_long, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, S_IFDIR};
+use libc::{c_char, c_int, c_long, c_uint, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, S_IFDIR};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::BufRead;
@@ -55,6 +55,10 @@ const AUTO_UMOUNT_FILE: &str = "auto-umount";
 const OPTIONS_FILE: &str = "mount-options";
 const GOCRYPTFS_DIR: &str = "gocryptfs";
 const GOCONF_FILE: &str = "gocryptfs.conf";
+
+// Upper bound on how long we wait for a helper (mount/unmount/passwd) to finish
+// before killing it. We use that to prevent blocking the login process.
+const HELPER_TIMEOUT_SECS: u64 = 30;
 
 #[repr(C)]
 pub struct pam_handle_t {
@@ -540,6 +544,35 @@ fn read_mount_options(filename: &str, options: &mut Vec<CString>) {
     }
 }
 
+// Wait for the process, but give up after the timeout and SIGKILL the child, so a
+// hung helper can never block login forever.
+fn wait_with_timeout(pid: pid_t, timeout_secs: u64) -> Option<c_int> {
+    unsafe {
+        let poll_interval_us: c_uint = 50_000; // 50ms
+        let max_polls = (timeout_secs * 1_000_000) / poll_interval_us as u64;
+        let mut st: c_int = 0;
+        let mut polls = 0u64;
+        loop {
+            let r = waitpid(pid, &mut st, libc::WNOHANG);
+            if r == pid {
+                return Some(st);
+            }
+            if r < 0 {
+                return None; // error, e.g. ECHILD
+            }
+            // r == 0: child is still running
+            if polls >= max_polls {
+                // Timed out: kill and reap so we don't leave a zombie behind.
+                libc::kill(pid, libc::SIGKILL);
+                let _ = waitpid(pid, &mut st, 0);
+                return None;
+            }
+            libc::usleep(poll_interval_us);
+            polls += 1;
+        }
+    }
+}
+
 fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, cipher_dir: &CStr, mountpoint: &CStr, pass: &CStr) {
     // Ensure cipherdir has a config file
     let conf_path = cstr(&format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE));
@@ -598,10 +631,10 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, 
             libc::_exit(1);
         }
         // Parent: wait for first child
-        let mut st: c_int = 0;
-        let r = waitpid(pid1, &mut st, 0);
-        if r < 0 || st != 0 {
-            syslog_warn("pam_gocryptfs: gocrypts mount failed");
+        match wait_with_timeout(pid1, HELPER_TIMEOUT_SECS) {
+            Some(st) if st == 0 => {}
+            Some(_) => syslog_warn("pam_gocryptfs: gocryptfs mount failed"),
+            None => syslog_warn("pam_gocryptfs: gocryptfs mount timed out or failed"),
         }
 
         // Parent can close fds now
@@ -637,10 +670,9 @@ fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr
             execl(umount_bin.as_ptr(), arg0_um.as_ptr(), mountpoint.as_ptr(), null::<c_char>());
             libc::_exit(1);
         }
-        let mut st: c_int = 0;
-        let r = waitpid(pid1, &mut st, 0);
-        if r < 0 || st != 0 {
-            syslog_warn("pam_gocryptfs: unmount failed");
+        match wait_with_timeout(pid1, HELPER_TIMEOUT_SECS) {
+            Some(st) if st == 0 => {}
+            _ => syslog_warn("pam_gocryptfs: unmount failed"),
         }
     }
 }
@@ -925,8 +957,7 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         close(stdin_wr);
 
         // Wait for child to finish
-        let mut _st: c_int = 0;
-        let _ = waitpid(pid, &mut _st, 0);
+        let _ = wait_with_timeout(pid, HELPER_TIMEOUT_SECS);
 
         // Restore privileges
         privs.restore_privileges();
