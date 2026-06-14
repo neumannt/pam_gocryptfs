@@ -912,8 +912,11 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
             return PAM_SUCCESS;
         }
 
-        // Fork and exec: gocryptfs -passwd -passfile /proc/self/fd/<old_rd> <cipherdir>
-        // The new password is provided twice via child's stdin.
+        // Fork and exec: gocryptfs -q -nosyslog -passwd <cipherdir>.
+        // gocryptfs reads passwords from stdin when stdin is not a TTY, so we
+        // feed the child the old password followed by the new password twice,
+        // each newline-terminated (this relies on gocryptfs's -passwd stdin
+        // behavior; there is no -passfile here).
         let pid = fork();
         if pid < 0 {
             syslog_err("pam_gocryptfs: fork() failed for password change");
