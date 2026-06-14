@@ -548,6 +548,12 @@ fn read_mount_options(filename: &str, options: &mut Vec<CString>) {
     }
 }
 
+// True iff the child terminated normally with exit status 0. `status` is the
+// encoded value from waitpid, not a plain exit code.
+fn exited_ok(status: c_int) -> bool {
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+}
+
 // Wait for the process, but give up after the timeout and SIGKILL the child, so a
 // hung helper can never block login forever.
 fn wait_with_timeout(pid: pid_t, timeout_secs: u64) -> Option<c_int> {
@@ -643,7 +649,7 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, 
         }
         // Parent: wait for first child
         match wait_with_timeout(pid1, HELPER_TIMEOUT_SECS) {
-            Some(st) if st == 0 => {}
+            Some(st) if exited_ok(st) => {}
             Some(_) => syslog_warn("pam_gocryptfs: gocryptfs mount failed"),
             None => syslog_warn("pam_gocryptfs: gocryptfs mount timed out or failed"),
         }
@@ -682,7 +688,7 @@ fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr
             libc::_exit(1);
         }
         match wait_with_timeout(pid1, HELPER_TIMEOUT_SECS) {
-            Some(st) if st == 0 => {}
+            Some(st) if exited_ok(st) => {}
             _ => syslog_warn("pam_gocryptfs: unmount failed"),
         }
     }
