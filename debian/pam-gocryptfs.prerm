@@ -3,27 +3,27 @@
 if [ "$1" = remove ]; then
 	# We should do some checking to prevent removal of pam-gocryptfs if in use
 	# Check active mounts
-	if out=`mount | grep "\Wtype\Wgocryptfs\W"`; then
+	if out=`mount 2>/dev/null | grep -E 'gocryptfs'`; then
 		echo "WARNING: Should not remove pam-gocryptfs, as it appears to be in use:" 1>&2
 		echo "$out" 1>&2
 	fi
-	if out=`grep "\Wgocryptfs\W" /proc/mounts`; then
+	if out=`grep -E 'gocryptfs' /proc/mounts 2>/dev/null`; then
 		echo "WARNING: Should not remove pam-gocryptfs, as it appears to be in use:" 1>&2
 		echo "$out" 1>&2
 	fi
 	# Check fstab
-	if out=`grep "\Wgocryptfs\W" /etc/fstab`; then
+	if out=`grep -E 'gocryptfs' /etc/fstab 2>/dev/null`; then
 		echo "WARNING: Should not remove pam-gocryptfs, as it appears to be in use:" 1>&2
 		echo "$out" 1>&2
 	fi
 	# Check home directories
-	for i in `ls /home`; do
-		if [ -d "/home/$i/.ecryptfs" ]; then
-			# If we find a .gocryptfs directory (or link) in a home,
+	getent passwd | while IFS=: read -r _name _passwd _uid _gid _gecos home _shell; do
+		if [ -n "$home" ] && [ -d "$home/.gocryptfs" ]; then
+			# If we find a .gocryptfs directory (or link) in a home
 			# directory, then someone is using pam-gocryptfs, and
 			# we should not allow package removal
 			echo "WARNING: Should not remove pam-gocryptfs, as it appears to be in use:" 1>&2
-			echo "       [/home/$i/.gocryptfs]" 1>&2
+			echo "       [$home/.gocryptfs]" 1>&2
 		fi
 	done
 	pam-auth-update --package --remove pam-gocryptfs
