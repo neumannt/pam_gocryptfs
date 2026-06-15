@@ -15,5 +15,9 @@ Architecture: linux-any
 Depends:
  ${misc:Depends}, ${shlibs:Depends},
  libpam-runtime
+Recommends:
+ gocryptfs, fuse3 | fuse
+Suggests:
+ rsync
 Description: PAM module that automatically mounts a gocryptfs director
  on login.

@@ -90,7 +90,28 @@ Notes:
     - Mount point: `~/Private`
 - If you insist on custom paths, pass absolute paths:
     - Example: `session optional pam_gocryptfs.so cipherdir=/home/%(USER)/.gocryptfs mountpoint=~/Private`
-    - The module does expand `~/`, `%(USER)`, `%(USERUID)`, and `%(USERGID)`.
+    - The module expands `~/`, `%(USER)`, `%(HOME)`, `%(USERUID)`, and `%(USERGID)`.
+
+### Per-user config file
+
+Each user may override the paths and pass extra gocryptfs flags via an optional
+file at `~/.gocryptfs/config`. It takes precedence over the PAM arguments, which
+in turn take precedence over the built-in defaults. Format:
+
+```
+# key=value lines set paths (with ~/ and %(…) expansion)
+cipherdir=/home/.gocryptfs/%(USER)
+mountpoint=%(HOME)
+
+# lines starting with '-' are extra gocryptfs flags, one per line
+-allow_other
+-nonempty
+```
+
+`cipherdir` names the directory whose `gocryptfs` subdirectory holds the cipher
+data (and the toggle files); `mountpoint` is where it is mounted. This file is
+what makes per-user, whole-home encryption possible without changing the
+system-wide PAM configuration (see below).
 
 ## Initialize per-user data
 
@@ -114,6 +135,38 @@ Now log out and log back in. On session open, the module will:
 
 - If not already mounted and `~/.gocryptfs/auto-mount` exists, run `gocryptfs` to mount `~/.gocryptfs` at `~/Private`.
 - On session close, if `~/.gocryptfs/auto-umount` exists, unmount `~/Private` using `fusermount3 -u`.
+
+## Encrypting the whole home directory
+
+Instead of a `~/Private` subdirectory you can encrypt the entire home, the way
+`ecryptfs-migrate-home` did for eCryptfs. No change to the PAM module is needed —
+it is driven entirely by the per-user `config` file described above. The
+`gocryptfs-migrate-home` script automates the conversion:
+
+```bash
+# As root, with the user logged out:
+sudo gocryptfs-migrate-home alice
+# add --allow-other if a service outside alice's session must read into the home
+```
+
+It initializes a cipher store **outside** the home at
+`/home/.gocryptfs/<user>/gocryptfs` (the cipher must live outside the
+mountpoint), copies the home into it, swaps the plaintext home for an empty
+mountpoint, and writes the `config` and opt-in toggles. Then it prints the steps
+to verify and, only afterwards, delete the plaintext backup. Use
+`gocryptfs-migrate-home --rollback <user>` to undo.
+
+Important caveats for whole-home encryption:
+
+- **The gocryptfs passphrase is the login password.** The script initializes the
+  filesystem with it, and keeping `pam_gocryptfs` in the `password` stack keeps
+  the two in sync on password change. If they ever diverge, the home stops
+  mounting.
+- **Password-less logins cannot decrypt the home.** SSH public-key logins,
+  autologin, and similar carry no `PAM_AUTHTOK`, so the session opens onto an
+  empty mount. This is inherent to the approach (eCryptfs had the same limit).
+- **`-allow_other`** (and `user_allow_other` in `/etc/fuse.conf`) may be needed
+  if a greeter or agent must read into the home from outside the user's session.
 
 ## Binary locations and permissions
 

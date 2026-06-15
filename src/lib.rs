@@ -17,6 +17,12 @@
 // - cipherdir=/path/to/cipher
 // - mountpoint=/path/to/mount
 //
+// Per-user config file (optional): $HOME/.gocryptfs/config
+// - cipherdir=... / mountpoint=... override the args (with ~/ and %(...) expansion)
+// - lines starting with '-' are extra gocryptfs flags (one per line)
+// - precedence: config file > PAM args > built-in defaults
+// - this is what enables whole-home encryption without a system-wide PAM change
+//
 // Build: link against pam and libc
 // Notes:
 // - This is a minimal/portable implementation. You may want to harden
@@ -28,10 +34,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::missing_safety_doc)]
 
-use libc::{c_char, c_int, c_long, c_uint, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, S_IFDIR};
+use libc::{c_char, c_int, c_long, c_uint, c_void, gid_t, mode_t, pid_t, size_t, uid_t, O_CLOEXEC, O_NOFOLLOW, S_IFDIR};
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::BufRead;
 use std::mem::zeroed;
 use std::os::fd::RawFd;
 use std::ptr::{null, null_mut};
@@ -52,7 +57,7 @@ const DEFAULT_MOUNT_DIR_NAME: &str = "Private";
 const DEFAULT_GCRYPTFS_BIN: &str = "/usr/bin/gocryptfs";
 const AUTO_MOUNT_FILE: &str = "auto-mount";
 const AUTO_UMOUNT_FILE: &str = "auto-umount";
-const OPTIONS_FILE: &str = "mount-options";
+const CONFIG_FILE: &str = "config";
 const GOCRYPTFS_DIR: &str = "gocryptfs";
 const GOCONF_FILE: &str = "gocryptfs.conf";
 
@@ -369,6 +374,7 @@ fn mounts_contains(mountpoint: &str) -> bool {
 fn map_var(pwd: &PasswordInfo, name: &str) -> String {
     match name {
         "USER" => pwd.name.to_string_lossy().to_string(),
+        "HOME" => pwd.dir.to_string_lossy().to_string(),
         "USERUID" => pwd.uid.to_string(),
         "USERGID" => pwd.gid.to_string(),
         _ => format!("%({})", name),
@@ -411,13 +417,110 @@ fn expand_vars(pwd: &PasswordInfo, s: String) -> String {
     result
 }
 
-fn build_default_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> (CString, CString, CString) {
-    let home = &pwd.dir;
-    let home_str = home.to_string_lossy();
-    let config_dir = cipher_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
+// Per-user overrides parsed from $HOME/.gocryptfs/config.
+struct UserConfig {
+    cipherdir: Option<String>,
+    mountpoint: Option<String>,
+    options: Vec<CString>,
+}
+
+impl UserConfig {
+    fn empty() -> Self {
+        UserConfig { cipherdir: None, mountpoint: None, options: Vec::new() }
+    }
+}
+
+// Fully resolved paths for a user, after folding in the per-user config file,
+// the PAM arguments, and the built-in defaults (in that order of precedence).
+struct ResolvedPaths {
+    cipher_dir: CString,
+    mountpoint: CString,
+    config_dir: CString,
+    options: Vec<CString>,
+}
+
+// True for a gocryptfs flag line that is safe to forward to the mount command.
+// Rejects foreground flags (which would hang the login) and embedded NULs.
+fn is_allowed_option(line: &str) -> bool {
+    line.starts_with('-') && !line.contains('\0') && line != "-f" && line != "-fg"
+}
+
+// Parse the per-user config file. Recognized line kinds:
+//   cipherdir=<path>    cipher data location (gocryptfs.conf lives in here)
+//   mountpoint=<path>   where the filesystem is mounted
+//   -<flag>             a gocryptfs flag, one per line (e.g. -allow_other)
+// Blank lines, '#' comments, and unrecognized keys are ignored.
+fn parse_user_config(contents: &str) -> UserConfig {
+    let mut cfg = UserConfig::empty();
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('-') {
+            if is_allowed_option(line) {
+                cfg.options.push(cstr(line));
+            }
+        } else if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "cipherdir" => cfg.cipherdir = Some(value.trim().to_string()),
+                "mountpoint" => cfg.mountpoint = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    cfg
+}
+
+// Read a small regular file securely. Path resolution can run while we are still
+// root (before privileges are dropped), so we refuse to follow a final symlink
+// and require the file to be a regular file owned by the target user. That keeps
+// a user from pointing the config at a file they do not own.
+fn read_owned_regular_file(path: &str, uid: uid_t) -> Option<String> {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let f = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_CLOEXEC).open(path).ok()?;
+    let md = f.metadata().ok()?;
+    if !md.is_file() || md.uid() != uid {
+        return None;
+    }
+    let mut buf = String::new();
+    // Cap the read so a pathological file can never exhaust memory.
+    f.take(64 * 1024).read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn read_user_config(pwd: &PasswordInfo) -> UserConfig {
+    let path = format!("{}/{}/{}", pwd.dir.to_string_lossy(), DEFAULT_CIPHER_DIR_NAME, CONFIG_FILE);
+    match read_owned_regular_file(&path, pwd.uid) {
+        Some(contents) => parse_user_config(&contents),
+        None => UserConfig::empty(),
+    }
+}
+
+// Resolve cipher dir, mount point, config (toggle) dir, and mount options.
+// Precedence for each path: per-user config file > PAM argument > built-in default.
+// The "config_dir" is the parent of the cipher data; toggles live there. The
+// cipher data itself is always its `gocryptfs` subdirectory.
+fn resolve_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> ResolvedPaths {
+    let user_cfg = read_user_config(pwd);
+    let home_str = pwd.dir.to_string_lossy();
+
+    let config_dir_spec = user_cfg.cipherdir.or_else(|| cipher_arg.map(|s| s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
+    let config_dir = expand_vars(pwd, config_dir_spec);
     let cipher_dir = format!("{}/{}", config_dir, GOCRYPTFS_DIR);
-    let mountpoint = mount_arg.map(|s| expand_vars(pwd, s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
-    (cstr(&cipher_dir), cstr(&mountpoint), cstr(&config_dir))
+
+    let mountpoint_spec = user_cfg.mountpoint.or_else(|| mount_arg.map(|s| s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
+    let mountpoint = expand_vars(pwd, mountpoint_spec);
+
+    ResolvedPaths {
+        cipher_dir: cstr(&cipher_dir),
+        mountpoint: cstr(&mountpoint),
+        config_dir: cstr(&config_dir),
+        options: user_cfg.options,
+    }
 }
 
 fn parse_pam_args(argc: c_int, argv: *const *const c_char) -> (Option<String>, Option<String>) {
@@ -530,20 +633,6 @@ fn impersonate_user_after_fork(pwd: &PasswordInfo, oeuid: uid_t) {
     }
 }
 
-fn read_mount_options(filename: &str, options: &mut Vec<CString>) {
-    use std::fs::File;
-    use std::io::BufReader;
-    if let Ok(file) = File::open(filename) {
-        let reader = BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
-            let line = line.trim();
-            if line.starts_with('-') && !line.contains('\0') && line != "-f" && line != "-fg" {
-                options.push(cstr(line));
-            }
-        }
-    }
-}
-
 // True iff the child terminated normally with exit status 0. `status` is the
 // encoded value from waitpid, not a plain exit code.
 fn exited_ok(status: c_int) -> bool {
@@ -579,7 +668,7 @@ fn wait_with_timeout(pid: pid_t, timeout_secs: u64) -> Option<c_int> {
     }
 }
 
-fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, cipher_dir: &CStr, mountpoint: &CStr, pass: &CStr) {
+fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipher_dir: &CStr, mountpoint: &CStr, pass: &CStr, options: &[CString]) {
     // Ensure cipherdir has a config file
     let conf_path = cstr(&format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE));
     if !file_exists(&conf_path) {
@@ -609,7 +698,7 @@ fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, config_dir: &CStr, 
     let bin = cstr(DEFAULT_GCRYPTFS_BIN);
     let passfile_arg = cstr(&format!("/proc/self/fd/{}", read_fd));
     let mut args: Vec<CString> = vec![cstr("gocryptfs"), cstr("-q"), cstr("-passfile"), passfile_arg];
-    read_mount_options(&format!("{}/{}", config_dir.to_string_lossy(), OPTIONS_FILE), &mut args);
+    args.extend(options.iter().cloned());
     let mut argv: Vec<*const c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
     argv.push(cipher_dir.as_ptr());
     argv.push(mountpoint.as_ptr());
@@ -710,16 +799,16 @@ pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, ar
 
     // Parse args and compute paths
     let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
-    let (_cipher_dir, mountpoint, config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let paths = resolve_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
-    // Honor per-user ~/.gocryptfs/auto-mount toggle
-    if !toggle_exists(&config_dir, AUTO_MOUNT_FILE) {
+    // Honor per-user auto-mount toggle
+    if !toggle_exists(&paths.config_dir, AUTO_MOUNT_FILE) {
         syslog_debug("pam_gocryptfs: auto-mount not enabled, skipping");
         return PAM_IGNORE;
     }
 
     // Already mounted?
-    if mounts_contains(&mountpoint.to_string_lossy()) {
+    if mounts_contains(&paths.mountpoint.to_string_lossy()) {
         syslog_debug("pam_gocryptfs: mountpoint already mounted, skipping");
         return PAM_IGNORE;
     }
@@ -754,15 +843,15 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
 
     // Parse args and compute paths
     let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
-    let (cipher_dir, mountpoint, config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let paths = resolve_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
-    // Honor per-user ~/.gocryptfs/auto-mount toggle
-    if !toggle_exists(&config_dir, AUTO_MOUNT_FILE) {
+    // Honor per-user auto-mount toggle
+    if !toggle_exists(&paths.config_dir, AUTO_MOUNT_FILE) {
         return PAM_SUCCESS;
     }
 
     // Already mounted?
-    if mounts_contains(&mountpoint.to_string_lossy()) {
+    if mounts_contains(&paths.mountpoint.to_string_lossy()) {
         return PAM_SUCCESS;
     }
 
@@ -788,7 +877,7 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
         let pass = CStr::from_ptr(pass_ptr as *const c_char);
 
         // Mount
-        mount_gocryptfs_as_user(&pwd, privs.oeuid, &config_dir, &cipher_dir, &mountpoint, pass);
+        mount_gocryptfs_as_user(&pwd, privs.oeuid, &paths.cipher_dir, &paths.mountpoint, pass, &paths.options);
 
         // Restore privileges
         privs.restore_privileges()
@@ -807,15 +896,15 @@ pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, a
         return PAM_SUCCESS;
     };
     let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
-    let (_cipher_dir, mountpoint, config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+    let paths = resolve_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
 
-    // Honor per-user ~/.gocryptfs/auto-umount toggle
-    if !toggle_exists(&config_dir, AUTO_UMOUNT_FILE) {
+    // Honor per-user auto-umount toggle
+    if !toggle_exists(&paths.config_dir, AUTO_UMOUNT_FILE) {
         syslog_debug("pam_gocryptfs: auto-umount not enabled, skipping");
         return PAM_SUCCESS;
     }
 
-    if !mounts_contains(&mountpoint.to_string_lossy()) {
+    if !mounts_contains(&paths.mountpoint.to_string_lossy()) {
         syslog_debug("pam_gocryptfs: not mounted, skipping umount");
         return PAM_SUCCESS;
     }
@@ -830,7 +919,7 @@ pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, a
         return PAM_SUCCESS;
     }
 
-    unmount_gocryptfs_as_user(&pwd, privs.oeuid, &mountpoint);
+    unmount_gocryptfs_as_user(&pwd, privs.oeuid, &paths.mountpoint);
 
     // Restore
     privs.restore_privileges();
@@ -883,8 +972,9 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         }
 
         // Determine cipherdir (ignore mountpoint here)
-        let (cipher_arg, _mount_arg) = parse_pam_args(argc, argv);
-        let (cipher_dir, _mountpoint, _config_dir) = build_default_paths(&pwd, cipher_arg.as_deref(), None);
+        let (cipher_arg, mount_arg) = parse_pam_args(argc, argv);
+        let paths = resolve_paths(&pwd, cipher_arg.as_deref(), mount_arg.as_deref());
+        let cipher_dir = paths.cipher_dir;
 
         // Ensure cipherdir has gocryptfs.conf
         let conf_path = cstr(&format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE));
@@ -988,4 +1078,55 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
     }
 
     PAM_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_option_rejects_foreground_and_non_flags() {
+        assert!(is_allowed_option("-allow_other"));
+        assert!(is_allowed_option("-nonempty"));
+        assert!(!is_allowed_option("-f"));
+        assert!(!is_allowed_option("-fg"));
+        assert!(!is_allowed_option("notaflag"));
+        assert!(!is_allowed_option("-bad\0flag"));
+    }
+
+    #[test]
+    fn parse_config_extracts_paths_and_options() {
+        let cfg = parse_user_config(
+            "# comment\n\
+             cipherdir=/home/.gocryptfs/%(USER)\n\
+             mountpoint=%(HOME)\n\
+             -nonempty\n\
+             -allow_other\n",
+        );
+        assert_eq!(cfg.cipherdir.as_deref(), Some("/home/.gocryptfs/%(USER)"));
+        assert_eq!(cfg.mountpoint.as_deref(), Some("%(HOME)"));
+        assert_eq!(cfg.options, vec![cstr("-nonempty"), cstr("-allow_other")]);
+    }
+
+    #[test]
+    fn parse_config_trims_and_ignores_unknown_keys() {
+        let cfg = parse_user_config("  cipherdir = /tmp/c  \n bogus=1 \n  \n# x\n");
+        assert_eq!(cfg.cipherdir.as_deref(), Some("/tmp/c"));
+        assert_eq!(cfg.mountpoint, None);
+        assert!(cfg.options.is_empty());
+    }
+
+    #[test]
+    fn parse_config_empty_is_empty() {
+        let cfg = parse_user_config("");
+        assert!(cfg.cipherdir.is_none() && cfg.mountpoint.is_none() && cfg.options.is_empty());
+    }
+
+    #[test]
+    fn expand_handles_home_and_user() {
+        let pwd = PasswordInfo { name: cstr("alice"), dir: cstr("/home/alice"), uid: 1000, gid: 1000 };
+        assert_eq!(expand_vars(&pwd, "%(HOME)".to_string()), "/home/alice");
+        assert_eq!(expand_vars(&pwd, "/home/.gocryptfs/%(USER)".to_string()), "/home/.gocryptfs/alice");
+        assert_eq!(expand_vars(&pwd, "~/Private".to_string()), "/home/alice/Private");
+    }
 }

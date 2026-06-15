@@ -1,0 +1,280 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# gocryptfs-migrate-home — convert a user's plaintext home directory into a
+# gocryptfs-encrypted home that pam_gocryptfs mounts at login.
+#
+# This is the analogue of ecryptfs-migrate-home. It does NOT require any change
+# to the PAM module: the module already takes its paths from a per-user config
+# file ($HOME/.gocryptfs/config), and the passphrase from the login password
+# (PAM_AUTHTOK). This script just lays out that configuration and moves the data.
+#
+# Resulting layout (default CIPHER_BASE=/home/.gocryptfs):
+#
+#   /home/.gocryptfs/<user>/gocryptfs/   cipher data (+ gocryptfs.conf)
+#   /home/.gocryptfs/<user>/auto-mount   opt-in toggles (the "config dir")
+#   /home/.gocryptfs/<user>/auto-umount
+#   <home>/.gocryptfs/config             control file, read BEFORE the mount
+#                                        (a copy also lives inside the encrypted
+#                                         home, read at logout while mounted)
+#
+# The cipher data lives OUTSIDE the home on purpose: gocryptfs forbids a cipher
+# dir inside its own mountpoint, and once the home is mounted it would be hidden.
+#
+# IMPORTANT
+#  * The gocryptfs passphrase MUST equal the user's login password, because
+#    pam_gocryptfs unlocks the filesystem with PAM_AUTHTOK. Keep them in sync by
+#    leaving pam_gocryptfs enabled in the "password" PAM stack.
+#  * Logins that carry no password (SSH public-key, autologin) cannot decrypt
+#    the home and will see an empty mount. This is inherent to the design.
+#  * A failed mount means an (almost) empty home at login, not just a missing
+#    subdirectory. The original home is kept as a backup until you verify a real
+#    login, then you delete it manually.
+
+set -euo pipefail
+
+PROG="${0##*/}"
+CIPHER_BASE="/home/.gocryptfs"
+GOCRYPTFS_BIN="/usr/bin/gocryptfs"
+ALLOW_OTHER=0
+FORCE=0
+DRY_RUN=0
+ACTION="migrate"
+
+STAGING=""        # set during migrate; cleaned up by the trap
+PWFILE=""
+
+die()  { echo "$PROG: error: $*" >&2; exit 1; }
+warn() { echo "$PROG: warning: $*" >&2; }
+info() { echo "$PROG: $*"; }
+run()  { if [ "$DRY_RUN" = 1 ]; then echo "+ $*"; else "$@"; fi; }
+
+usage() {
+	cat <<EOF
+Usage: $PROG [options] <user>
+       $PROG --rollback <user>
+
+Migrate <user>'s home directory to a gocryptfs-encrypted home.
+
+Options:
+  --allow-other      add -allow_other to the mount options (also needs
+                     'user_allow_other' in /etc/fuse.conf); use when a service
+                     outside the user's session must read into the home
+  --cipher-base DIR  parent directory for cipher data (default: $CIPHER_BASE)
+  --rollback         undo a migration: restore the plaintext backup and remove
+                     the cipher data and config (the user must be logged out)
+  --force            skip the "user is logged in" safety check
+  --dry-run          print the steps without changing anything
+  -h, --help         show this help
+
+Run as root. The user must be logged out. You will be prompted for the user's
+LOGIN password (it becomes the gocryptfs passphrase).
+EOF
+}
+
+# ---- argument parsing -------------------------------------------------------
+
+TARGET=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--allow-other) ALLOW_OTHER=1 ;;
+		--cipher-base) shift; [ $# -gt 0 ] || die "--cipher-base needs an argument"; CIPHER_BASE="$1" ;;
+		--rollback)    ACTION="rollback" ;;
+		--force)       FORCE=1 ;;
+		--dry-run)     DRY_RUN=1 ;;
+		-h|--help)     usage; exit 0 ;;
+		-*)            die "unknown option: $1 (try --help)" ;;
+		*)             [ -z "$TARGET" ] || die "only one user may be given"; TARGET="$1" ;;
+	esac
+	shift
+done
+
+[ -n "$TARGET" ] || { usage >&2; exit 2; }
+[ "$(id -u)" = 0 ] || die "must run as root"
+
+# ---- resolve the account ----------------------------------------------------
+
+PW_ENT="$(getent passwd "$TARGET")" || die "no such user: $TARGET"
+IFS=: read -r U_NAME _ U_UID U_GID _ U_HOME U_SHELL <<<"$PW_ENT"
+[ -n "$U_HOME" ] || die "user $TARGET has no home directory"
+[ -d "$U_HOME" ] || die "home directory $U_HOME does not exist"
+
+CIPHER_DIR="$CIPHER_BASE/$U_NAME"   # the module's "config dir" (holds toggles)
+CIPHER_DATA="$CIPHER_DIR/gocryptfs" # the actual gocryptfs cipher directory
+BACKUP="$U_HOME.pre-gocryptfs-$(date +%Y%m%d-%H%M%S)"
+
+command -v "$GOCRYPTFS_BIN" >/dev/null 2>&1 || command -v gocryptfs >/dev/null 2>&1 \
+	|| die "gocryptfs not found"
+command -v rsync >/dev/null 2>&1 || die "rsync not found"
+
+# Refuse to run while the user has live processes (a busy home cannot be
+# swapped safely). --force overrides for unusual setups.
+user_is_active() { pgrep -u "$U_UID" >/dev/null 2>&1; }
+
+# Emit the per-user control file. Same content for the underlying copy (read
+# before the mount) and the in-cipher copy (read at logout while mounted).
+write_config() {
+	local dest="$1"
+	{
+		echo "# pam_gocryptfs per-user config — managed by $PROG"
+		echo "cipherdir=$CIPHER_BASE/%(USER)"
+		echo "mountpoint=%(HOME)"
+		# The underlying home is non-empty (it holds .gocryptfs/config), so the
+		# mount must be allowed over a non-empty directory.
+		echo "-nonempty"
+		[ "$ALLOW_OTHER" = 1 ] && echo "-allow_other"
+	} >"$dest"
+}
+
+# ---- rollback ---------------------------------------------------------------
+
+do_rollback() {
+	info "rolling back $U_NAME"
+	if mount | grep -q " on $U_HOME type fuse"; then
+		die "$U_HOME is still mounted; log the user out (or unmount) first"
+	fi
+	local backup
+	backup="$(ls -1dt "$U_HOME".pre-gocryptfs-* 2>/dev/null | head -n1 || true)"
+	[ -n "$backup" ] || die "no $U_HOME.pre-gocryptfs-* backup found"
+
+	info "restoring $backup -> $U_HOME"
+	run rm -rf "$U_HOME"
+	run mv "$backup" "$U_HOME"
+	info "removing cipher data $CIPHER_DIR"
+	run rm -rf "$CIPHER_DIR"
+	info "rollback complete"
+	exit 0
+}
+
+[ "$ACTION" = rollback ] && do_rollback
+
+# ---- migrate ----------------------------------------------------------------
+
+# Idempotency / safety guards.
+[ -e "$CIPHER_DATA/gocryptfs.conf" ] && die "$CIPHER_DATA already initialized — already migrated?"
+[ -e "$U_HOME/.gocryptfs/config" ] && grep -q '^mountpoint=%(HOME)' "$U_HOME/.gocryptfs/config" 2>/dev/null \
+	&& die "$U_HOME already has a whole-home config — already migrated?"
+
+if user_is_active; then
+	if [ "$FORCE" = 1 ]; then
+		warn "$U_NAME has running processes; continuing because of --force"
+	else
+		die "$U_NAME has running processes — log them out first (or use --force)"
+	fi
+fi
+
+# Rough free-space check: cipher data needs about as much room as the home.
+NEED_KB="$(du -sk "$U_HOME" 2>/dev/null | awk '{print $1}')"
+FREE_KB="$(df -Pk "$(dirname "$CIPHER_BASE")" | awk 'NR==2{print $4}')"
+if [ -n "$NEED_KB" ] && [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt "$NEED_KB" ]; then
+	die "not enough free space near $CIPHER_BASE (need ~${NEED_KB}K, have ${FREE_KB}K)"
+fi
+
+echo
+echo "About to migrate:"
+echo "  user        : $U_NAME (uid=$U_UID gid=$U_GID)"
+echo "  home        : $U_HOME"
+echo "  cipher data : $CIPHER_DATA"
+echo "  backup      : $BACKUP"
+echo "  allow_other : $([ "$ALLOW_OTHER" = 1 ] && echo yes || echo no)"
+echo
+
+# Prompt for the login password (twice). It MUST be the account's login
+# password, or the home will never mount at login.
+read -rsp "Enter $U_NAME's LOGIN password: " PW1; echo
+read -rsp "Re-enter to confirm: " PW2; echo
+[ "$PW1" = "$PW2" ] || die "passwords do not match"
+[ -n "$PW1" ] || die "empty password not allowed"
+
+# A passfile the target user can read; cleaned up on exit.
+PWFILE="$(mktemp)"
+chmod 600 "$PWFILE"
+chown "$U_UID:$U_GID" "$PWFILE"
+printf '%s\n' "$PW1" >"$PWFILE"
+unset PW1 PW2
+
+cleanup() {
+	[ -n "$PWFILE" ] && rm -f "$PWFILE" 2>/dev/null || true
+	if [ -n "$STAGING" ] && mountpoint -q "$STAGING" 2>/dev/null; then
+		runuser -u "$U_NAME" -- fusermount3 -u "$STAGING" 2>/dev/null \
+			|| runuser -u "$U_NAME" -- fusermount -u "$STAGING" 2>/dev/null || true
+	fi
+	[ -n "$STAGING" ] && rmdir "$STAGING" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# 1. Create the cipher store, owned by the user, and initialize it.
+info "creating cipher store $CIPHER_DATA"
+run install -d -m 0755 -o root -g root "$CIPHER_BASE"
+run install -d -m 0700 -o "$U_UID" -g "$U_GID" "$CIPHER_DIR"
+run install -d -m 0700 -o "$U_UID" -g "$U_GID" "$CIPHER_DATA"
+
+info "initializing gocryptfs (passphrase = login password)"
+run runuser -u "$U_NAME" -- "$GOCRYPTFS_BIN" -init -q -passfile "$PWFILE" "$CIPHER_DATA"
+
+# 2. Mount the cipher at a staging point and copy the home into it (as the user,
+#    so a user-mounted FUSE filesystem stays writable and ownership is right).
+STAGING="$(mktemp -d)"
+chown "$U_UID:$U_GID" "$STAGING"
+chmod 0700 "$STAGING"
+info "mounting cipher at staging $STAGING"
+run runuser -u "$U_NAME" -- "$GOCRYPTFS_BIN" -q -passfile "$PWFILE" "$CIPHER_DATA" "$STAGING"
+
+info "copying home contents into the encrypted store (this can take a while)"
+# Exclude any pre-existing .gocryptfs (e.g. a previous ~/Private subdir setup);
+# we write a fresh control file below.
+run runuser -u "$U_NAME" -- rsync -aHAX --numeric-ids --info=progress2 \
+	--exclude='/.gocryptfs' "$U_HOME/" "$STAGING/"
+
+info "writing in-home control file"
+run runuser -u "$U_NAME" -- install -d -m 0700 "$STAGING/.gocryptfs"
+if [ "$DRY_RUN" = 1 ]; then
+	echo "+ write config -> $STAGING/.gocryptfs/config"
+else
+	write_config "$STAGING/.gocryptfs/config"
+	chown "$U_UID:$U_GID" "$STAGING/.gocryptfs/config"
+fi
+
+info "unmounting staging"
+run runuser -u "$U_NAME" -- sh -c "fusermount3 -u '$STAGING' 2>/dev/null || fusermount -u '$STAGING'"
+
+# 3. Swap the plaintext home for a fresh empty mountpoint and lay down the
+#    pre-mount control file + opt-in toggles.
+info "moving plaintext home aside: $U_HOME -> $BACKUP"
+run mv "$U_HOME" "$BACKUP"
+run install -d -m 0700 -o "$U_UID" -g "$U_GID" "$U_HOME"
+run install -d -m 0700 -o "$U_UID" -g "$U_GID" "$U_HOME/.gocryptfs"
+if [ "$DRY_RUN" = 1 ]; then
+	echo "+ write config -> $U_HOME/.gocryptfs/config"
+else
+	write_config "$U_HOME/.gocryptfs/config"
+	chown "$U_UID:$U_GID" "$U_HOME/.gocryptfs/config"
+fi
+
+info "enabling auto mount/umount toggles"
+run install -m 0600 -o "$U_UID" -g "$U_GID" /dev/null "$CIPHER_DIR/auto-mount"
+run install -m 0600 -o "$U_UID" -g "$U_GID" /dev/null "$CIPHER_DIR/auto-umount"
+
+# /etc/fuse.conf reminder for allow_other.
+if [ "$ALLOW_OTHER" = 1 ] && ! grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
+	warn "--allow-other set but 'user_allow_other' is not enabled in /etc/fuse.conf"
+fi
+
+cat <<EOF
+
+Migration complete.
+
+Next steps:
+  1. Make sure pam_gocryptfs is enabled (auth, session, and password stacks).
+     On Debian/Ubuntu: 'pam-auth-update' and ensure the gocryptfs profile is on.
+  2. Log in as $U_NAME on a TEXT console (Ctrl+Alt+F3), not the graphical
+     greeter, for the first test.
+  3. Verify the home is decrypted and mounted:
+         mount | grep gocryptfs
+         ls -a ~
+  4. Only once you are satisfied, delete the plaintext backup:
+         rm -rf "$BACKUP"
+
+If the first login shows an empty home, do NOT delete the backup. Roll back with:
+     $PROG --rollback $U_NAME
+EOF

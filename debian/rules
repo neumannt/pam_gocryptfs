@@ -18,5 +18,7 @@ override_dh_auto_install:
 
 	install -D -m 0644 debian/local/pam-gocryptfs.pam-auth-update debian/pam-gocryptfs/usr/share/pam-configs/pam-gocryptfs
 
+	install -D -m 0755 scripts/gocryptfs-migrate-home debian/pam-gocryptfs/usr/sbin/gocryptfs-migrate-home
+
 .PHONY: override_dh_auto_build \
 	override_dh_auto_install
