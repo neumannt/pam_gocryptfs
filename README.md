@@ -160,8 +160,17 @@ Important caveats for whole-home encryption:
 
 - **The gocryptfs passphrase is the login password.** The script initializes the
   filesystem with it, and keeping `pam_gocryptfs` in the `password` stack keeps
-  the two in sync on password change. If they ever diverge, the home stops
-  mounting.
+  the two in sync on password change. If they ever diverge (e.g. the password is
+  reset with `passwd`/`chpasswd`, which carry no usable old token), the home
+  stops mounting at login — but this is recoverable: change the login password
+  back to the old one, or re-key the cipher with the still-working old password
+  (`gocryptfs -passwd <cipherdir>`). It is only unrecoverable if no working
+  passphrase is known at all.
+- **Save the gocryptfs master key.** It is the one recovery path that works
+  regardless of the password (`gocryptfs --masterkey ...` to mount). Dump it once
+  and store it offline (password manager, printout) — never on the encrypted
+  volume:
+  `gocryptfs-xray -dumpmasterkey /home/.gocryptfs/<user>/gocryptfs/gocryptfs.conf`
 - **Password-less logins cannot decrypt the home.** SSH public-key logins,
   autologin, and similar carry no `PAM_AUTHTOK`, so the session opens onto an
   empty mount. This is inherent to the approach (eCryptfs had the same limit).

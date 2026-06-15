@@ -272,7 +272,12 @@ Next steps:
   3. Verify the home is decrypted and mounted:
          mount | grep gocryptfs
          ls -a ~
-  4. Only once you are satisfied, delete the plaintext backup:
+  4. Save the gocryptfs master key somewhere safe and OFFLINE (password
+     manager, printout) — it is the only recovery path if the passphrase is
+     ever lost, and must never be stored on the encrypted volume. Dump it with:
+         gocryptfs-xray -dumpmasterkey "$CIPHER_DATA/gocryptfs.conf"
+     (We deliberately do not print or store it for you.)
+  5. Only once you are satisfied, delete the plaintext backup:
          rm -rf "$BACKUP"
 
 If the first login shows an empty home, do NOT delete the backup. Roll back with:
