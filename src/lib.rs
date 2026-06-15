@@ -810,6 +810,75 @@ fn unmount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, mountpoint: &CStr
     }
 }
 
+// Ask systemd-logind whether `uid` has any login session other than the one
+// being closed. We use this to avoid unmounting a shared home out from under a
+// still-active concurrent session (logind already does the session bookkeeping
+// correctly, including crash cleanup, so we lean on it instead of inventing our
+// own reference count).
+//
+// libsystemd is loaded lazily via dlopen so the module carries no hard
+// dependency: on a system without it (or without a tracked session, or on a
+// query error) we return None and the caller proceeds with today's behavior.
+// Some(true) => other sessions exist (skip unmount); Some(false) => we are the
+// last session (unmount).
+fn user_has_other_sessions(uid: uid_t) -> Option<bool> {
+    type PidGetSession = unsafe extern "C" fn(pid_t, *mut *mut c_char) -> c_int;
+    type UidGetSessions = unsafe extern "C" fn(uid_t, c_int, *mut *mut *mut c_char) -> c_int;
+
+    unsafe {
+        let lib = libc::dlopen(c"libsystemd.so.0".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if lib.is_null() {
+            return None;
+        }
+
+        let pgs = libc::dlsym(lib, c"sd_pid_get_session".as_ptr());
+        let ugs = libc::dlsym(lib, c"sd_uid_get_sessions".as_ptr());
+        if pgs.is_null() || ugs.is_null() {
+            libc::dlclose(lib);
+            return None;
+        }
+        let sd_pid_get_session: PidGetSession = std::mem::transmute(pgs);
+        let sd_uid_get_sessions: UidGetSessions = std::mem::transmute(ugs);
+
+        // Identify the session being torn down. If we cannot, do not guess —
+        // fall back to the default behavior rather than risk a wrong decision.
+        let mut my_session: *mut c_char = null_mut();
+        if sd_pid_get_session(0, &mut my_session) < 0 || my_session.is_null() {
+            libc::dlclose(lib);
+            return None;
+        }
+
+        // Enumerate all of the user's sessions. Comparing against our own id (and
+        // excluding it) makes the result independent of PAM stack ordering: it
+        // does not matter whether logind has already dropped our session by now.
+        let mut sessions: *mut *mut c_char = null_mut();
+        let n = sd_uid_get_sessions(uid, 0, &mut sessions);
+
+        let mut result = None;
+        if n >= 0 {
+            let mut other = false;
+            if !sessions.is_null() {
+                let mut i = 0isize;
+                while !(*sessions.offset(i)).is_null() {
+                    let p = *sessions.offset(i);
+                    if libc::strcmp(p, my_session) != 0 {
+                        other = true;
+                    }
+                    libc::free(p as *mut c_void);
+                    i += 1;
+                }
+            }
+            result = Some(other);
+        }
+        if !sessions.is_null() {
+            libc::free(sessions as *mut c_void);
+        }
+        libc::free(my_session as *mut c_void);
+        libc::dlclose(lib);
+        result
+    }
+}
+
 // ----- PAM entry points -----
 
 #[no_mangle]
@@ -931,6 +1000,15 @@ pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, a
 
     if !mounts_contains(&paths.mountpoint.to_string_lossy()) {
         syslog_debug("pam_gocryptfs: not mounted, skipping umount");
+        return PAM_SUCCESS;
+    }
+
+    // If the user still has other login sessions, one of them may be using this
+    // mount; leave it and let the last session's close do the unmount. If we
+    // cannot tell (no logind), fall through to the unmount as before — the
+    // non-lazy fusermount -u still refuses to pull the rug while files are open.
+    if user_has_other_sessions(pwd.uid) == Some(true) {
+        syslog_debug("pam_gocryptfs: user has other active sessions, skipping umount");
         return PAM_SUCCESS;
     }
 
