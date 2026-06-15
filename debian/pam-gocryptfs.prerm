@@ -2,30 +2,54 @@
 
 if [ "$1" = remove ]; then
 	# We should do some checking to prevent removal of pam-gocryptfs if in use
+	in_use=0
+
 	# Check active mounts
-	if out=`mount 2>/dev/null | grep -E 'gocryptfs'`; then
-		echo "WARNING: Should not remove pam-gocryptfs, as it appears to be in use:" 1>&2
-		echo "$out" 1>&2
+	out=$(awk '$3 == "fuse.gocryptfs" || $3 == "gocryptfs"' /proc/mounts 2>/dev/null) || true
+	if [ -n "$out" ]; then
+		echo "pam-gocryptfs: active gocryptfs mounts:" >&2
+		echo "$out" >&2
+		in_use=1
 	fi
-	if out=`grep -E 'gocryptfs' /proc/mounts 2>/dev/null`; then
-		echo "WARNING: Should not remove pam-gocryptfs, as it appears to be in use:" 1>&2
-		echo "$out" 1>&2
-	fi
+
 	# Check fstab
-	if out=`grep -E 'gocryptfs' /etc/fstab 2>/dev/null`; then
-		echo "WARNING: Should not remove pam-gocryptfs, as it appears to be in use:" 1>&2
-		echo "$out" 1>&2
+	out=$(awk '$1 !~ /^#/ && ($3 == "fuse.gocryptfs" || $3 == "gocryptfs")' /etc/fstab 2>/dev/null) || true
+	if [ -n "$out" ]; then
+		echo "pam-gocryptfs: gocryptfs entries in /etc/fstab:" >&2
+		echo "$out" >&2
+		in_use=1
 	fi
+
 	# Check home directories
-	getent passwd | while IFS=: read -r _name _passwd _uid _gid _gecos home _shell; do
+	homes=$(getent passwd | while IFS=: read -r _name _passwd _uid _gid _gecos home _shell; do
 		if [ -n "$home" ] && [ -d "$home/.gocryptfs" ]; then
-			# If we find a .gocryptfs directory (or link) in a home
-			# directory, then someone is using pam-gocryptfs, and
-			# we should not allow package removal
-			echo "WARNING: Should not remove pam-gocryptfs, as it appears to be in use:" 1>&2
-			echo "       [$home/.gocryptfs]" 1>&2
+			echo "  $home/.gocryptfs"
 		fi
-	done
+	done) || true
+	if [ -n "$homes" ]; then
+		echo "pam-gocryptfs: home directories still configured for gocryptfs:" >&2
+		echo "$homes" >&2
+		in_use=1
+	fi
+
+	if [ "$in_use" = 1 ]; then
+		echo "WARNING: pam-gocryptfs appears to be in use; removing it will stop" >&2
+		echo "         encrypted home/Private directories from mounting at login." >&2
+		if [ -t 0 ] && [ -t 1 ]; then
+			# Interactive run: let the admin decide. Default (empty/no) aborts.
+			printf "Remove pam-gocryptfs anyway? [y/N] " >&2
+			read -r reply || reply=""
+			case "$reply" in
+				[Yy] | [Yy][Ee][Ss]) ;;
+				*) echo "Aborting removal of pam-gocryptfs." >&2; exit 1 ;;
+			esac
+		else
+			# Non-interactive (apt unattended, cron, etc.): warn and continue so
+			# automated removals are not wedged.
+			echo "         (non-interactive run; continuing with removal anyway.)" >&2
+		fi
+	fi
+
 	pam-auth-update --package --remove pam-gocryptfs
 fi
 
