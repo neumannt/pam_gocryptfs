@@ -481,7 +481,7 @@ fn read_owned_regular_file(path: &str, uid: uid_t) -> Option<String> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let f = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_CLOEXEC).open(path).ok()?;
+    let f = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW | O_CLOEXEC | libc::O_NONBLOCK).open(path).ok()?;
     let md = f.metadata().ok()?;
     if !md.is_file() || md.uid() != uid {
         return None;
