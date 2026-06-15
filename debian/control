@@ -1,7 +1,7 @@
 Source: pam-gocryptfs
 Section: misc
 Priority: optional
-Maintainer: Thomas Neumann <>
+Maintainer: Thomas Neumann <nobody@pam-gocryptfs.invalid>
 Build-Depends:
  debhelper-compat (= 13),
  cargo, rustc, libpam-dev

@@ -1,5 +1,12 @@
+pam-gocryptfs (0.2) unstable; urgency=medium
+
+  * Various robustness improvements.
+  * Login should never fail due to gocryptfs issues.
+
+ -- Thomas Neumann <nobody@pam-gocryptfs.invalid>  Mon, 15 Jun 2026 07:51:42 +0100
+
 pam-gocryptfs (0.1) unstable; urgency=medium
 
   * Initial release.
 
- -- Thomas Neumann <>  Wed, 07 Jan 2026 13:55:00 +0100
+ -- Thomas Neumann <nobody@pam-gocryptfs.invalid>  Wed, 07 Jan 2026 13:55:00 +0100
