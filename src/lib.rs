@@ -350,6 +350,31 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
+// The kernel escapes space, tab, newline and backslash in the fields of
+// /proc/self/mounts as octal \ooo sequences. Decode them so a mount target that
+// contains such a character compares correctly. A backslash not followed by
+// three octal digits is left as-is.
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = String::with_capacity(field.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let oct = &bytes[i + 1..i + 4];
+            if oct.iter().all(|b| (b'0'..=b'7').contains(b)) {
+                // u32 math so a (kernel-impossible) \7xx can't overflow the byte.
+                let v = (oct[0] - b'0') as u32 * 64 + (oct[1] - b'0') as u32 * 8 + (oct[2] - b'0') as u32;
+                out.push(v as u8 as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn mounts_contains(mountpoint: &str) -> bool {
     let needle = normalize_path(mountpoint);
     // Check if mountpoint is a gocryptfs mount (type "fuse.gocryptfs" or "gocryptfs")
@@ -361,7 +386,7 @@ fn mounts_contains(mountpoint: &str) -> bool {
             let tgt = it.next();
             let fstype = it.next();
             if let (Some(t), Some(ft)) = (tgt, fstype) {
-                if normalize_path(t) == needle && (ft == "fuse.gocryptfs" || ft == "gocryptfs") {
+                if normalize_path(&unescape_mount_field(t)) == needle && (ft == "fuse.gocryptfs" || ft == "gocryptfs") {
                     return true;
                 }
             }
@@ -1070,8 +1095,15 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         }
         close(stdin_wr);
 
-        // Wait for child to finish
-        let _ = wait_with_timeout(pid, HELPER_TIMEOUT_SECS);
+        // Wait for child to finish. A non-zero exit means gocryptfs did not change
+        // the passphrase (e.g. the old password we fed it was not the current
+        // gocryptfs passphrase). Log it: the cipher passphrase and the login
+        // password have now diverged, and the home will stop mounting at login.
+        match wait_with_timeout(pid, HELPER_TIMEOUT_SECS) {
+            Some(st) if exited_ok(st) => {}
+            Some(_) => syslog_warn("pam_gocryptfs: gocryptfs passphrase change failed; cipher passphrase may now differ from the login password"),
+            None => syslog_warn("pam_gocryptfs: gocryptfs passphrase change timed out or failed"),
+        }
 
         // Restore privileges
         privs.restore_privileges();
@@ -1128,5 +1160,18 @@ mod tests {
         assert_eq!(expand_vars(&pwd, "%(HOME)".to_string()), "/home/alice");
         assert_eq!(expand_vars(&pwd, "/home/.gocryptfs/%(USER)".to_string()), "/home/.gocryptfs/alice");
         assert_eq!(expand_vars(&pwd, "~/Private".to_string()), "/home/alice/Private");
+    }
+
+    #[test]
+    fn unescape_mount_field_decodes_octal() {
+        // space \040, tab \011, newline \012, backslash \134
+        assert_eq!(unescape_mount_field("/home/a\\040b"), "/home/a b");
+        assert_eq!(unescape_mount_field("/x\\011y\\012z"), "/x\ty\nz");
+        assert_eq!(unescape_mount_field("/a\\134b"), "/a\\b");
+        // no escapes: unchanged
+        assert_eq!(unescape_mount_field("/home/alice/Private"), "/home/alice/Private");
+        // a lone backslash or short tail is left as-is
+        assert_eq!(unescape_mount_field("/a\\b"), "/a\\b");
+        assert_eq!(unescape_mount_field("/a\\04"), "/a\\04");
     }
 }
