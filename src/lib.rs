@@ -98,6 +98,7 @@ extern "C" {
     fn getegid() -> gid_t;
     fn getgroups(size: c_int, list: *mut gid_t) -> c_int;
     fn setgroups(size: c_int, list: *const gid_t) -> c_int;
+    fn getgrouplist(user: *const c_char, group: gid_t, groups: *mut gid_t, ngroups: *mut c_int) -> c_int;
 
     fn setegid(gid: gid_t) -> c_int;
     fn seteuid(uid: uid_t) -> c_int;
@@ -219,6 +220,32 @@ struct PasswordInfo {
     dir: CString,
     uid: uid_t,
     gid: gid_t,
+    // Full group set (primary + supplementary), resolved before any fork().
+    groups: Vec<gid_t>,
+}
+
+// Resolve the user's group list, falling back to the primary group on failure.
+fn fetch_groups(name: &CStr, gid: gid_t) -> Vec<gid_t> {
+    unsafe {
+        let ngroups_max = sysconf(libc::_SC_NGROUPS_MAX);
+        let cap = if ngroups_max > 0 { (ngroups_max as usize) + 1 } else { 64 };
+        let mut groups: Vec<gid_t> = vec![0; cap];
+        let mut n: c_int = cap as c_int;
+        if getgrouplist(name.as_ptr(), gid, groups.as_mut_ptr(), &mut n) < 0 || n <= 0 {
+            // On overflow n holds the required size, so grow and retry.
+            if n > 0 && (n as usize) > cap {
+                groups.resize(n as usize, 0);
+                if getgrouplist(name.as_ptr(), gid, groups.as_mut_ptr(), &mut n) >= 0 && n > 0 {
+                    groups.truncate(n as usize);
+                    return groups;
+                }
+            }
+            syslog_warn("pam_gocryptfs: getgrouplist() failed; using primary group only");
+            return vec![gid];
+        }
+        groups.truncate(n as usize);
+        groups
+    }
 }
 
 fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo> {
@@ -249,11 +276,14 @@ fn fetch_pwd(pam: &PamHandle) -> Option<PasswordInfo> {
                 syslog(libc::LOG_ERR, cstr("pam_gocryptfs: getpwnam() failed\n").as_ptr());
                 return None;
             }
+            let name = CStr::from_ptr(pwd.pw_name).to_owned();
+            let groups = fetch_groups(&name, pwd.pw_gid);
             return Some(PasswordInfo {
-                name: CStr::from_ptr(pwd.pw_name).to_owned(),
+                name,
                 dir: CStr::from_ptr(pwd.pw_dir).to_owned(),
                 uid: pwd.pw_uid,
                 gid: pwd.pw_gid,
+                groups,
             });
         }
     }
@@ -284,9 +314,16 @@ impl Privileges {
             Privileges { oeuid, oegid, groups }
         }
     }
-    // Drop privileges
-    fn drop_privileges(&self, uid: uid_t, gid: gid_t) -> bool {
-        unsafe { setegid(gid) >= 0 && setgroups(1, &gid as *const gid_t) >= 0 && seteuid(uid) >= 0 }
+    // Drop privileges, including the user's supplementary groups
+    fn drop_privileges(&self, pwd: &PasswordInfo) -> bool {
+        unsafe {
+            let (gptr, gcount) = if pwd.groups.is_empty() {
+                (&pwd.gid as *const gid_t, 1)
+            } else {
+                (pwd.groups.as_ptr(), pwd.groups.len() as c_int)
+            };
+            setegid(pwd.gid) >= 0 && setgroups(gcount, gptr) >= 0 && seteuid(pwd.uid) >= 0
+        }
     }
     // Restore privileges to the state before drop_privileges() was called.
     fn restore_privileges(&self) {
@@ -649,7 +686,13 @@ fn impersonate_user_after_fork(pwd: &PasswordInfo, oeuid: uid_t) {
         if seteuid(oeuid) < 0 {
             libc::_exit(1);
         }
-        if setgroups(1, &pwd.gid as *const gid_t) < 0 || setgid(pwd.gid) < 0 {
+        // The full group set, so the gocryptfs daemon can chgrp to the user's groups
+        let (gptr, gcount) = if pwd.groups.is_empty() {
+            (&pwd.gid as *const gid_t, 1)
+        } else {
+            (pwd.groups.as_ptr(), pwd.groups.len() as c_int)
+        };
+        if setgroups(gcount, gptr) < 0 || setgid(pwd.gid) < 0 {
             libc::_exit(1);
         }
         if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
@@ -953,7 +996,7 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
         // Temporarily drop to user for mounting
         let privs = Privileges::new();
 
-        if !privs.drop_privileges(pwd.uid, pwd.gid) {
+        if !privs.drop_privileges(&pwd) {
             syslog_err("pam_gocryptfs: failed to drop privileges");
             // Attempt to restore anyway
             privs.restore_privileges();
@@ -1015,7 +1058,7 @@ pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, a
     // Drop to user and unmount
     let privs = Privileges::new();
 
-    if !privs.drop_privileges(pwd.uid, pwd.gid) {
+    if !privs.drop_privileges(&pwd) {
         syslog_err("pam_gocryptfs: failed to drop privileges (umount)");
         // Attempt to restore anyway
         privs.restore_privileges();
@@ -1099,7 +1142,7 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         // Drop privileges to the user for the exec
         let privs = Privileges::new();
 
-        if !privs.drop_privileges(pwd.uid, pwd.gid) {
+        if !privs.drop_privileges(&pwd) {
             syslog_err("pam_gocryptfs: failed to drop privileges for password change");
             close(stdin_rd);
             close(stdin_wr);
@@ -1234,7 +1277,7 @@ mod tests {
 
     #[test]
     fn expand_handles_home_and_user() {
-        let pwd = PasswordInfo { name: cstr("alice"), dir: cstr("/home/alice"), uid: 1000, gid: 1000 };
+        let pwd = PasswordInfo { name: cstr("alice"), dir: cstr("/home/alice"), uid: 1000, gid: 1000, groups: vec![1000] };
         assert_eq!(expand_vars(&pwd, "%(HOME)".to_string()), "/home/alice");
         assert_eq!(expand_vars(&pwd, "/home/.gocryptfs/%(USER)".to_string()), "/home/.gocryptfs/alice");
         assert_eq!(expand_vars(&pwd, "~/Private".to_string()), "/home/alice/Private");
