@@ -102,8 +102,6 @@ extern "C" {
 
     fn setegid(gid: gid_t) -> c_int;
     fn seteuid(uid: uid_t) -> c_int;
-    fn setgid(gid: gid_t) -> c_int;
-    fn setresuid(ruid: uid_t, euid: uid_t, suid: uid_t) -> c_int;
 
     fn fork() -> pid_t;
     fn waitpid(pid: pid_t, status: *mut c_int, options: c_int) -> pid_t;
@@ -171,12 +169,42 @@ fn store_password(pamh: *mut pam_handle_t, pass: &CStr) -> c_int {
     }
 }
 
+// Drop our copy of the passphrase. pam_set_data() runs the cleanup handler of
+// the entry it replaces, so this wipes and frees the old buffer.
+fn clear_password(pamh: *mut pam_handle_t) {
+    unsafe {
+        let _ = pam_set_data(pamh, UNIQUE_DATA_KEY.as_ptr(), null_mut(), None);
+    }
+}
+
 fn cstr(s: &str) -> CString {
     let bytes = match s.find('\0') {
         Some(pos) => &s.as_bytes()[..pos],
         None => s.as_bytes(),
     };
     CString::new(bytes).unwrap()
+}
+
+// Paths come from /etc/passwd and from the user's config file, and neither is
+// guaranteed to be UTF-8. We therefore carry every path as raw bytes and only
+// convert at the boundary where the kernel wants a NUL-terminated string.
+fn cstr_from_bytes(mut bytes: Vec<u8>) -> CString {
+    if let Some(pos) = bytes.iter().position(|&b| b == 0) {
+        bytes.truncate(pos);
+    }
+    CString::new(bytes).unwrap()
+}
+
+fn join_bytes(base: &[u8], sub: &[u8]) -> Vec<u8> {
+    let mut joined = Vec::with_capacity(base.len() + 1 + sub.len());
+    joined.extend_from_slice(base);
+    joined.push(b'/');
+    joined.extend_from_slice(sub);
+    joined
+}
+
+fn join_cstr(base: &CStr, sub: &str) -> CString {
+    cstr_from_bytes(join_bytes(base.to_bytes(), sub.as_bytes()))
 }
 
 fn syslog_err(msg: &str) {
@@ -328,10 +356,12 @@ impl Privileges {
     // Restore privileges to the state before drop_privileges() was called.
     fn restore_privileges(&self) {
         unsafe {
-            let _ = seteuid(self.oeuid);
-            let _ = setegid(self.oegid);
-            if !self.groups.is_empty() {
-                let _ = setgroups(self.groups.len() as c_int, self.groups.as_ptr());
+            if seteuid(self.oeuid) < 0 || setegid(self.oegid) < 0 {
+                syslog_err("pam_gocryptfs: failed to restore privileges");
+            }
+            let (gptr, gcount) = if self.groups.is_empty() { (null(), 0) } else { (self.groups.as_ptr(), self.groups.len() as c_int) };
+            if setgroups(gcount, gptr) < 0 {
+                syslog_err("pam_gocryptfs: failed to restore supplementary groups");
             }
         }
     }
@@ -345,8 +375,7 @@ fn file_exists(path: &CStr) -> bool {
 }
 
 fn toggle_exists(path: &CStr, file: &str) -> bool {
-    let toggle_path = cstr(&format!("{}/{}", path.to_string_lossy(), file));
-    file_exists(&toggle_path)
+    file_exists(&join_cstr(path, file))
 }
 
 fn ensure_dir(path: &CStr, mode: mode_t) -> bool {
@@ -360,17 +389,17 @@ fn ensure_dir(path: &CStr, mode: mode_t) -> bool {
     }
 }
 
-fn normalize_path(path: &str) -> String {
+fn normalize_path(path: &[u8]) -> Vec<u8> {
     if path.is_empty() {
-        return String::new();
+        return Vec::new();
     }
-    let absolute = path.starts_with('/');
-    let mut parts: Vec<&str> = Vec::new();
-    for component in path.split('/') {
+    let absolute = path[0] == b'/';
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for component in path.split(|&b| b == b'/') {
         match component {
-            "" | "." => {}
-            ".." => match parts.last() {
-                Some(&"..") | None if !absolute => parts.push(".."),
+            b"" | b"." => {}
+            b".." => match parts.last() {
+                Some(&b"..") | None if !absolute => parts.push(b".."),
                 None => {}
                 _ => {
                     parts.pop();
@@ -379,51 +408,55 @@ fn normalize_path(path: &str) -> String {
             c => parts.push(c),
         }
     }
-    let joined = parts.join("/");
+    let mut out = Vec::with_capacity(path.len());
     if absolute {
-        format!("/{}", joined)
-    } else {
-        joined
+        out.push(b'/');
     }
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
+    out
 }
 
 // The kernel escapes space, tab, newline and backslash in the fields of
 // /proc/self/mounts as octal \ooo sequences. Decode them so a mount target that
 // contains such a character compares correctly. A backslash not followed by
 // three octal digits is left as-is.
-fn unescape_mount_field(field: &str) -> String {
-    let bytes = field.as_bytes();
-    let mut out = String::with_capacity(field.len());
+fn unescape_mount_field(field: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(field.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            let oct = &bytes[i + 1..i + 4];
+    while i < field.len() {
+        if field[i] == b'\\' && i + 3 < field.len() {
+            let oct = &field[i + 1..i + 4];
             if oct.iter().all(|b| (b'0'..=b'7').contains(b)) {
                 // u32 math so a (kernel-impossible) \7xx can't overflow the byte.
                 let v = (oct[0] - b'0') as u32 * 64 + (oct[1] - b'0') as u32 * 8 + (oct[2] - b'0') as u32;
-                out.push(v as u8 as char);
+                out.push(v as u8);
                 i += 4;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(field[i]);
         i += 1;
     }
     out
 }
 
-fn mounts_contains(mountpoint: &str) -> bool {
-    let needle = normalize_path(mountpoint);
+fn mounts_contains(mountpoint: &CStr) -> bool {
+    let needle = normalize_path(mountpoint.to_bytes());
     // Check if mountpoint is a gocryptfs mount (type "fuse.gocryptfs" or "gocryptfs")
-    if let Ok(contents) = fs::read_to_string("/proc/self/mounts") {
-        for line in contents.lines() {
+    if let Ok(contents) = fs::read("/proc/self/mounts") {
+        for line in contents.split(|&b| b == b'\n') {
             // Each line: <src> <target> <fstype> <opts> ...
-            let mut it = line.split_whitespace();
+            let mut it = line.split(|&b| b == b' ' || b == b'\t').filter(|f| !f.is_empty());
             let _src = it.next();
             let tgt = it.next();
             let fstype = it.next();
             if let (Some(t), Some(ft)) = (tgt, fstype) {
-                if normalize_path(&unescape_mount_field(t)) == needle && (ft == "fuse.gocryptfs" || ft == "gocryptfs") {
+                if matches!(ft, b"fuse.gocryptfs" | b"gocryptfs") && normalize_path(&unescape_mount_field(t)) == needle {
                     return true;
                 }
             }
@@ -433,47 +466,49 @@ fn mounts_contains(mountpoint: &str) -> bool {
 }
 
 // expand a variable that occurred in a path specifier
-fn map_var(pwd: &PasswordInfo, name: &str) -> String {
+fn map_var(pwd: &PasswordInfo, name: &[u8]) -> Vec<u8> {
     match name {
-        "USER" => pwd.name.to_string_lossy().to_string(),
-        "HOME" => pwd.dir.to_string_lossy().to_string(),
-        "USERUID" => pwd.uid.to_string(),
-        "USERGID" => pwd.gid.to_string(),
-        _ => format!("%({})", name),
+        b"USER" => pwd.name.to_bytes().to_vec(),
+        b"HOME" => pwd.dir.to_bytes().to_vec(),
+        b"USERUID" => pwd.uid.to_string().into_bytes(),
+        b"USERGID" => pwd.gid.to_string().into_bytes(),
+        // Unknown variable: leave the reference untouched.
+        _ => {
+            let mut verbatim = b"%(".to_vec();
+            verbatim.extend_from_slice(name);
+            verbatim.push(b')');
+            verbatim
+        }
     }
 }
 
 // expand all variables (and leading ~/) that occur in a path specifier
-fn expand_vars(pwd: &PasswordInfo, s: String) -> String {
+fn expand_vars(pwd: &PasswordInfo, spec: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(spec.len());
+
     // Expand home directory
-    let s = if let Some(p) = s.strip_prefix("~/") { format!("{}/{}", pwd.dir.to_string_lossy(), p) } else { s };
+    let rest = match spec.strip_prefix(b"~/") {
+        Some(tail) => {
+            result.extend_from_slice(pwd.dir.to_bytes());
+            result.push(b'/');
+            tail
+        }
+        None => spec,
+    };
 
     // Expand variables
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    #[allow(clippy::while_let_on_iterator)]
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            if let Some('(') = chars.peek() {
-                // Consume the '('
-                chars.next();
-                let mut var_name = String::new();
-                // Collect characters until ')'
-                while let Some(c) = chars.next() {
-                    if c == ')' {
-                        break;
-                    }
-                    var_name.push(c);
-                }
-                // Replace with the mapped value
-                result.push_str(&map_var(pwd, &var_name));
-            } else {
-                // Just push the '%' if not followed by '('
-                result.push(c);
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == b'%' && rest.get(i + 1) == Some(&b'(') {
+            // An unterminated "%(" is copied through verbatim.
+            if let Some(len) = rest[i + 2..].iter().position(|&b| b == b')') {
+                result.extend_from_slice(&map_var(pwd, &rest[i + 2..i + 2 + len]));
+                i += 2 + len + 1;
+                continue;
             }
-        } else {
-            result.push(c);
         }
+        result.push(rest[i]);
+        i += 1;
     }
 
     result
@@ -502,9 +537,17 @@ struct ResolvedPaths {
 }
 
 // True for a gocryptfs flag line that is safe to forward to the mount command.
-// Rejects foreground flags (which would hang the login) and embedded NULs.
+//
+// This is an accident guard, not a security boundary: the mount runs as the
+// user, so anything they put here they could equally well run by hand. We only
+// filter out what would break their own login. A foreground mount never
+// returns, so it would stall the session until the helper timeout kills it.
 fn is_allowed_option(line: &str) -> bool {
-    line.starts_with('-') && !line.contains('\0') && line != "-f" && line != "-fg"
+    if !line.starts_with('-') || line.contains('\0') {
+        return false;
+    }
+    let name = line.trim_start_matches('-').split('=').next().unwrap_or("");
+    !name.is_empty() && !matches!(name, "f" | "fg")
 }
 
 // Parse the per-user config file. Recognized line kinds:
@@ -538,7 +581,14 @@ fn parse_user_config(contents: &str) -> UserConfig {
 // root (before privileges are dropped), so we refuse to follow a final symlink
 // and require the file to be a regular file owned by the target user. That keeps
 // a user from pointing the config at a file they do not own.
-fn read_owned_regular_file(path: &str, uid: uid_t) -> Option<String> {
+//
+// Note that only the final component is protected this way: the directories
+// leading up to it belong to the user, so they can redirect the lookup. That
+// is accepted — the owner check keeps them from reading anything they do not
+// already own, and doing better would mean either resolving the path component
+// by component or dropping privileges for every login, including the ones that
+// never use this module.
+fn read_owned_regular_file(path: &std::path::Path, uid: uid_t) -> Option<String> {
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -555,8 +605,12 @@ fn read_owned_regular_file(path: &str, uid: uid_t) -> Option<String> {
 }
 
 fn read_user_config(pwd: &PasswordInfo) -> UserConfig {
-    let path = format!("{}/{}/{}", pwd.dir.to_string_lossy(), DEFAULT_CIPHER_DIR_NAME, CONFIG_FILE);
-    match read_owned_regular_file(&path, pwd.uid) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = join_bytes(pwd.dir.to_bytes(), DEFAULT_CIPHER_DIR_NAME.as_bytes());
+    let path = join_bytes(&dir, CONFIG_FILE.as_bytes());
+    match read_owned_regular_file(std::path::Path::new(OsStr::from_bytes(&path)), pwd.uid) {
         Some(contents) => parse_user_config(&contents),
         None => UserConfig::empty(),
     }
@@ -568,19 +622,24 @@ fn read_user_config(pwd: &PasswordInfo) -> UserConfig {
 // cipher data itself is always its `gocryptfs` subdirectory.
 fn resolve_paths(pwd: &PasswordInfo, cipher_arg: Option<&str>, mount_arg: Option<&str>) -> ResolvedPaths {
     let user_cfg = read_user_config(pwd);
-    let home_str = pwd.dir.to_string_lossy();
 
-    let config_dir_spec = user_cfg.cipherdir.or_else(|| cipher_arg.map(|s| s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_CIPHER_DIR_NAME));
-    let config_dir = expand_vars(pwd, config_dir_spec);
-    let cipher_dir = format!("{}/{}", config_dir, GOCRYPTFS_DIR);
+    // A spec taken from the config file or the PAM arguments goes through
+    // variable expansion; the built-in default is already a literal path.
+    let resolve = |spec: Option<String>, arg: Option<&str>, default_name: &str| -> Vec<u8> {
+        match spec.map(String::into_bytes).or_else(|| arg.map(|s| s.as_bytes().to_vec())) {
+            Some(spec) => expand_vars(pwd, &spec),
+            None => join_bytes(pwd.dir.to_bytes(), default_name.as_bytes()),
+        }
+    };
 
-    let mountpoint_spec = user_cfg.mountpoint.or_else(|| mount_arg.map(|s| s.to_string())).unwrap_or_else(|| format!("{}/{}", home_str, DEFAULT_MOUNT_DIR_NAME));
-    let mountpoint = expand_vars(pwd, mountpoint_spec);
+    let config_dir = resolve(user_cfg.cipherdir, cipher_arg, DEFAULT_CIPHER_DIR_NAME);
+    let cipher_dir = join_bytes(&config_dir, GOCRYPTFS_DIR.as_bytes());
+    let mountpoint = resolve(user_cfg.mountpoint, mount_arg, DEFAULT_MOUNT_DIR_NAME);
 
     ResolvedPaths {
-        cipher_dir: cstr(&cipher_dir),
-        mountpoint: cstr(&mountpoint),
-        config_dir: cstr(&config_dir),
+        cipher_dir: cstr_from_bytes(cipher_dir),
+        mountpoint: cstr_from_bytes(mountpoint),
+        config_dir: cstr_from_bytes(config_dir),
         options: user_cfg.options,
     }
 }
@@ -647,14 +706,13 @@ fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
             if pipe(fds.as_mut_ptr()) != 0 {
                 return None;
             }
-            // Set CLOEXEC on write end; we will clear it on read end
-            let flags = libc::fcntl(fds[0], libc::F_GETFD);
-            if flags >= 0 {
-                libc::fcntl(fds[0], libc::F_SETFD, flags | libc::FD_CLOEXEC);
-            }
-            let flags_r = libc::fcntl(fds[1], libc::F_GETFD);
-            if flags_r >= 0 {
-                libc::fcntl(fds[1], libc::F_SETFD, flags_r | libc::FD_CLOEXEC);
+            // Match pipe2(O_CLOEXEC): set it on both ends. The child clears it
+            // again on the read end just before exec'ing gocryptfs.
+            for fd in fds {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
             }
         }
         let read_fd = fds[0];
@@ -680,22 +738,50 @@ fn create_pass_pipe_with_data(pass: &[u8]) -> Option<(RawFd, RawFd)> {
     }
 }
 
+// Credential switching between fork() and execve().
+//
+// glibc's setuid()/setgid()/setgroups() wrappers are not async-signal-safe:
+// they broadcast the change to every thread via the setxid signal machinery.
+// The host of a PAM module is frequently multi-threaded (a display manager,
+// sshd), and in a forked child that machinery can deadlock. The child is
+// single-threaded and wants exactly the plain per-process kernel semantics,
+// so it issues the syscalls directly.
+//
+// The 32-bit x86 and arm ABIs carry a legacy generation of these calls that
+// truncates ids to 16 bits; there the "*32" numbers are the correct ones.
+#[cfg(not(any(target_arch = "x86", target_arch = "arm")))]
+use libc::{SYS_setgroups as SYS_SETGROUPS, SYS_setresgid as SYS_SETRESGID, SYS_setresuid as SYS_SETRESUID};
+#[cfg(any(target_arch = "x86", target_arch = "arm"))]
+use libc::{SYS_setgroups32 as SYS_SETGROUPS, SYS_setresgid32 as SYS_SETRESGID, SYS_setresuid32 as SYS_SETRESUID};
+
+// The id value that means "leave this one as it is".
+const ID_UNCHANGED: uid_t = !0;
+
+unsafe fn raw_setresuid(ruid: uid_t, euid: uid_t, suid: uid_t) -> c_long {
+    libc::syscall(SYS_SETRESUID, ruid, euid, suid)
+}
+
+unsafe fn raw_setresgid(rgid: gid_t, egid: gid_t, sgid: gid_t) -> c_long {
+    libc::syscall(SYS_SETRESGID, rgid, egid, sgid)
+}
+
+unsafe fn raw_setgroups(list: &[gid_t]) -> c_long {
+    libc::syscall(SYS_SETGROUPS, list.len() as c_long, list.as_ptr())
+}
+
 // Become the mounting user in a child process
 fn impersonate_user_after_fork(pwd: &PasswordInfo, oeuid: uid_t) {
     unsafe {
-        if seteuid(oeuid) < 0 {
+        // Regain the original (root) euid; the changes below need it.
+        if raw_setresuid(ID_UNCHANGED, oeuid, ID_UNCHANGED) < 0 {
             libc::_exit(1);
         }
         // The full group set, so the gocryptfs daemon can chgrp to the user's groups
-        let (gptr, gcount) = if pwd.groups.is_empty() {
-            (&pwd.gid as *const gid_t, 1)
-        } else {
-            (pwd.groups.as_ptr(), pwd.groups.len() as c_int)
-        };
-        if setgroups(gcount, gptr) < 0 || setgid(pwd.gid) < 0 {
+        let groups = if pwd.groups.is_empty() { std::slice::from_ref(&pwd.gid) } else { pwd.groups.as_slice() };
+        if raw_setgroups(groups) < 0 || raw_setresgid(pwd.gid, pwd.gid, pwd.gid) < 0 {
             libc::_exit(1);
         }
-        if setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
+        if raw_setresuid(pwd.uid, pwd.uid, pwd.uid) < 0 {
             libc::_exit(1);
         }
     }
@@ -736,10 +822,55 @@ fn wait_with_timeout(pid: pid_t, timeout_secs: u64) -> Option<c_int> {
     }
 }
 
+// Blocks SIGPIPE for the duration of a write into a pipe whose reader is a
+// child process. Should the child die before reading (a failed exec, say), the
+// default SIGPIPE action would take down the host process — passwd, login, or
+// the display manager — instead of just failing the write with EPIPE.
+//
+// The signal is generated synchronously for the writing thread, so blocking it
+// per-thread is enough and leaves other threads of the host undisturbed.
+struct SigPipeBlocked {
+    previous: libc::sigset_t,
+    active: bool,
+}
+
+impl SigPipeBlocked {
+    fn new() -> Self {
+        unsafe {
+            let mut set: libc::sigset_t = zeroed();
+            let mut previous: libc::sigset_t = zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGPIPE);
+            let active = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous) == 0;
+            SigPipeBlocked { previous, active }
+        }
+    }
+}
+
+impl Drop for SigPipeBlocked {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        unsafe {
+            // Discard a SIGPIPE we provoked ourselves, so it does not fire the
+            // instant the old mask is restored. If the host already had the
+            // signal blocked, a pending one may be theirs, so leave it alone.
+            if libc::sigismember(&self.previous, libc::SIGPIPE) == 0 {
+                let mut set: libc::sigset_t = zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGPIPE);
+                let immediately = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                while libc::sigtimedwait(&set, null_mut(), &immediately) == libc::SIGPIPE {}
+            }
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, null_mut());
+        }
+    }
+}
+
 fn mount_gocryptfs_as_user(pwd: &PasswordInfo, oeuid: uid_t, cipher_dir: &CStr, mountpoint: &CStr, pass: &CStr, options: &[CString]) {
     // Ensure cipherdir has a config file
-    let conf_path = cstr(&format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE));
-    if !file_exists(&conf_path) {
+    if !file_exists(&join_cstr(cipher_dir, GOCONF_FILE)) {
         syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping mount");
         return;
     }
@@ -945,7 +1076,7 @@ pub extern "C" fn pam_sm_authenticate(pamh: *mut pam_handle_t, _flags: c_int, ar
     }
 
     // Already mounted?
-    if mounts_contains(&paths.mountpoint.to_string_lossy()) {
+    if mounts_contains(&paths.mountpoint) {
         syslog_debug("pam_gocryptfs: mountpoint already mounted, skipping");
         return PAM_IGNORE;
     }
@@ -970,6 +1101,12 @@ pub extern "C" fn pam_sm_setcred(_pamh: *mut pam_handle_t, _flags: c_int, _argc:
 
 #[no_mangle]
 pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
+    let rc = open_session(pamh, argc, argv);
+    clear_password(pamh);
+    rc
+}
+
+fn open_session(pamh: *mut pam_handle_t, argc: c_int, argv: *const *const c_char) -> c_int {
     let pam = PamHandle::new(pamh);
     let pwd = fetch_pwd(&pam);
     let pwd = if let Some(pwd) = pwd {
@@ -988,7 +1125,7 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
     }
 
     // Already mounted?
-    if mounts_contains(&paths.mountpoint.to_string_lossy()) {
+    if mounts_contains(&paths.mountpoint) {
         return PAM_SUCCESS;
     }
 
@@ -1006,7 +1143,7 @@ pub extern "C" fn pam_sm_open_session(pamh: *mut pam_handle_t, _flags: c_int, ar
         // Obtain passphrase
         let mut pass_ptr: *const c_void = zeroed();
         let rc = pam_get_data(pamh, UNIQUE_DATA_KEY.as_ptr(), &mut pass_ptr);
-        if rc != PAM_SUCCESS {
+        if rc != PAM_SUCCESS || pass_ptr.is_null() {
             syslog_warn("pam_gocryptfs: unable to retrieve passphrase; skipping mount");
             privs.restore_privileges();
             return PAM_SUCCESS;
@@ -1041,7 +1178,7 @@ pub extern "C" fn pam_sm_close_session(pamh: *mut pam_handle_t, _flags: c_int, a
         return PAM_SUCCESS;
     }
 
-    if !mounts_contains(&paths.mountpoint.to_string_lossy()) {
+    if !mounts_contains(&paths.mountpoint) {
         syslog_debug("pam_gocryptfs: not mounted, skipping umount");
         return PAM_SUCCESS;
     }
@@ -1123,8 +1260,7 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         let cipher_dir = paths.cipher_dir;
 
         // Ensure cipherdir has gocryptfs.conf
-        let conf_path = cstr(&format!("{}/{}", cipher_dir.to_string_lossy(), GOCONF_FILE));
-        if !file_exists(&conf_path) {
+        if !file_exists(&join_cstr(&cipher_dir, GOCONF_FILE)) {
             syslog_warn("pam_gocryptfs: No gocryptfs.conf found in cipherdir; skipping password change");
             return PAM_SUCCESS;
         }
@@ -1205,7 +1341,12 @@ pub extern "C" fn pam_sm_chauthtok(pamh: *mut pam_handle_t, flags: c_int, argc: 
         buf.push(b'\n');
 
         let buf_len = buf.len();
-        let wrote = write(stdin_wr, buf.as_ptr() as *const c_void, buf_len);
+        let wrote = {
+            // The child is the only reader; if it died before reading, this
+            // write must fail with EPIPE rather than kill us with SIGPIPE.
+            let _no_sigpipe = SigPipeBlocked::new();
+            write(stdin_wr, buf.as_ptr() as *const c_void, buf_len)
+        };
         // Zero password buffer before dropping
         for b in buf.iter_mut() {
             std::ptr::write_volatile(b, 0);
@@ -1241,9 +1382,17 @@ mod tests {
     fn allowed_option_rejects_foreground_and_non_flags() {
         assert!(is_allowed_option("-allow_other"));
         assert!(is_allowed_option("-nonempty"));
+        assert!(is_allowed_option("--allow_other"));
         assert!(!is_allowed_option("-f"));
         assert!(!is_allowed_option("-fg"));
+        // Every spelling Go's flag package would accept for the same flag
+        assert!(!is_allowed_option("--fg"));
+        assert!(!is_allowed_option("-fg=true"));
+        assert!(!is_allowed_option("--fg=true"));
+        assert!(!is_allowed_option("--f=1"));
         assert!(!is_allowed_option("notaflag"));
+        assert!(!is_allowed_option("-"));
+        assert!(!is_allowed_option("--"));
         assert!(!is_allowed_option("-bad\0flag"));
     }
 
@@ -1275,24 +1424,76 @@ mod tests {
         assert!(cfg.cipherdir.is_none() && cfg.mountpoint.is_none() && cfg.options.is_empty());
     }
 
+    fn test_pwd(dir: &[u8]) -> PasswordInfo {
+        PasswordInfo { name: cstr("alice"), dir: cstr_from_bytes(dir.to_vec()), uid: 1000, gid: 1000, groups: vec![1000] }
+    }
+
     #[test]
     fn expand_handles_home_and_user() {
-        let pwd = PasswordInfo { name: cstr("alice"), dir: cstr("/home/alice"), uid: 1000, gid: 1000, groups: vec![1000] };
-        assert_eq!(expand_vars(&pwd, "%(HOME)".to_string()), "/home/alice");
-        assert_eq!(expand_vars(&pwd, "/home/.gocryptfs/%(USER)".to_string()), "/home/.gocryptfs/alice");
-        assert_eq!(expand_vars(&pwd, "~/Private".to_string()), "/home/alice/Private");
+        let pwd = test_pwd(b"/home/alice");
+        assert_eq!(expand_vars(&pwd, b"%(HOME)"), b"/home/alice");
+        assert_eq!(expand_vars(&pwd, b"/home/.gocryptfs/%(USER)"), b"/home/.gocryptfs/alice");
+        assert_eq!(expand_vars(&pwd, b"~/Private"), b"/home/alice/Private");
+        assert_eq!(expand_vars(&pwd, b"/srv/%(USERUID)/%(USERGID)"), b"/srv/1000/1000");
+        // unknown variables and stray '%' survive untouched
+        assert_eq!(expand_vars(&pwd, b"/a/%(NOPE)/100%"), b"/a/%(NOPE)/100%");
+        assert_eq!(expand_vars(&pwd, b"/a/%(unterminated"), b"/a/%(unterminated");
+    }
+
+    #[test]
+    fn expand_preserves_non_utf8_home() {
+        // A home directory that is not valid UTF-8 must come through byte for byte.
+        let pwd = test_pwd(b"/home/\xff");
+        assert_eq!(expand_vars(&pwd, b"%(HOME)/Private"), b"/home/\xff/Private");
+        assert_eq!(expand_vars(&pwd, b"~/Private"), b"/home/\xff/Private");
+    }
+
+    #[test]
+    fn resolve_paths_precedence_and_defaults() {
+        // A home that cannot exist, so no real config file interferes.
+        let pwd = test_pwd(b"/nonexistent/alice");
+        // Built-in defaults when neither the config file nor an argument applies.
+        let p = resolve_paths(&pwd, None, None);
+        assert_eq!(p.config_dir.to_bytes(), b"/nonexistent/alice/.gocryptfs");
+        assert_eq!(p.cipher_dir.to_bytes(), b"/nonexistent/alice/.gocryptfs/gocryptfs");
+        assert_eq!(p.mountpoint.to_bytes(), b"/nonexistent/alice/Private");
+        // PAM arguments win over the defaults and get variable expansion.
+        let p = resolve_paths(&pwd, Some("/srv/%(USER)"), Some("~/Secret"));
+        assert_eq!(p.config_dir.to_bytes(), b"/srv/alice");
+        assert_eq!(p.cipher_dir.to_bytes(), b"/srv/alice/gocryptfs");
+        assert_eq!(p.mountpoint.to_bytes(), b"/nonexistent/alice/Secret");
+        // (the config file takes precedence over both; it is covered by
+        // parse_user_config, since reading it needs a real home directory)
+    }
+
+    #[test]
+    fn normalize_path_collapses_redundant_components() {
+        assert_eq!(normalize_path(b"/home//alice/./Private"), b"/home/alice/Private");
+        assert_eq!(normalize_path(b"/home/alice/../alice/Private/"), b"/home/alice/Private");
+        assert_eq!(normalize_path(b"/.."), b"/");
+        assert_eq!(normalize_path(b"a/../../b"), b"../b");
+        assert_eq!(normalize_path(b""), b"");
     }
 
     #[test]
     fn unescape_mount_field_decodes_octal() {
         // space \040, tab \011, newline \012, backslash \134
-        assert_eq!(unescape_mount_field("/home/a\\040b"), "/home/a b");
-        assert_eq!(unescape_mount_field("/x\\011y\\012z"), "/x\ty\nz");
-        assert_eq!(unescape_mount_field("/a\\134b"), "/a\\b");
+        assert_eq!(unescape_mount_field(b"/home/a\\040b"), b"/home/a b");
+        assert_eq!(unescape_mount_field(b"/x\\011y\\012z"), b"/x\ty\nz");
+        assert_eq!(unescape_mount_field(b"/a\\134b"), b"/a\\b");
         // no escapes: unchanged
-        assert_eq!(unescape_mount_field("/home/alice/Private"), "/home/alice/Private");
+        assert_eq!(unescape_mount_field(b"/home/alice/Private"), b"/home/alice/Private");
         // a lone backslash or short tail is left as-is
-        assert_eq!(unescape_mount_field("/a\\b"), "/a\\b");
-        assert_eq!(unescape_mount_field("/a\\04"), "/a\\04");
+        assert_eq!(unescape_mount_field(b"/a\\b"), b"/a\\b");
+        assert_eq!(unescape_mount_field(b"/a\\04"), b"/a\\04");
+    }
+
+    #[test]
+    fn unescape_mount_field_is_byte_transparent() {
+        // Non-ASCII bytes must survive unchanged, or a mount point such as
+        // /home/josé/Private would never match what the kernel reports.
+        let path = "/home/josé/Private".as_bytes();
+        assert_eq!(unescape_mount_field(path), path);
+        assert_eq!(normalize_path(&unescape_mount_field(path)), normalize_path(path));
     }
 }

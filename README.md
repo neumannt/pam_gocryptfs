@@ -38,7 +38,7 @@ The easiest way is to just build a Debian package and install that, it will setu
 
 ```bash
 dpkg-buildpackage -us -uc -i -I
-dpkg -i ../pam-gocryptfs_0.1_amd64.deb
+dpkg -i ../pam-gocryptfs_*_amd64.deb
 ```
 
 ## Manual installation
@@ -172,8 +172,9 @@ Important caveats for whole-home encryption:
   volume:
   `gocryptfs-xray -dumpmasterkey /home/.gocryptfs/<user>/gocryptfs/gocryptfs.conf`
 - **Password-less logins cannot decrypt the home.** SSH public-key logins,
-  autologin, and similar carry no `PAM_AUTHTOK`, so the session opens onto an
-  empty mount. This is inherent to the approach (eCryptfs had the same limit).
+  autologin, and similar never run the `auth` stack at all, so no passphrase
+  reaches the module and the session opens onto an empty mount. This is
+  inherent to the approach (eCryptfs had the same limit).
 - **`-allow_other`** (and `user_allow_other` in `/etc/fuse.conf`) may be needed
   if a greeter or agent must read into the home from outside the user's session.
 

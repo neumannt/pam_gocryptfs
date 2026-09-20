@@ -19,5 +19,11 @@ Recommends:
  gocryptfs, fuse3 | fuse
 Suggests:
  rsync
-Description: PAM module that automatically mounts a gocryptfs director
+Description: PAM module that automatically mounts a gocryptfs directory
  on login.
+ .
+ It mounts a per-user gocryptfs filesystem when the session opens, using the
+ login password as the passphrase, and unmounts it when the last session of
+ that user closes. Paths and mount options are configurable per user, so it
+ can serve either a ~/Private subdirectory or a fully encrypted home
+ directory. Inspired by pam_ecryptfs.

@@ -1,3 +1,10 @@
+pam-gocryptfs (0.4) unstable; urgency=medium
+
+  * Improve robustness.
+  * Fix packaging issues.
+
+ -- Thomas Neumann <nobody@pam-gocryptfs.invalid>  Sat, 20 Sep 2026 14:30:00 +0200
+
 pam-gocryptfs (0.3) unstable; urgency=medium
 
   * Keep the user's supplementary groups when impersonating

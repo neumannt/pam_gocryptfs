@@ -7,3 +7,4 @@
 /debian/pam-gocryptfs.debhelper.log
 /debian/pam-gocryptfs.substvars
 /debian/tmp
+.idea/
