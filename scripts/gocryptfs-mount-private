@@ -1,0 +1,181 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# gocryptfs-mount-private — mount the calling user's gocryptfs directory by hand.
+#
+# This is the analogue of ecryptfs-mount-private. pam_gocryptfs unlocks the
+# filesystem with the login password, so logins that carry no password (SSH
+# public-key, autologin) end up with nothing mounted. Run this script from such
+# a session to mount it explicitly; it prompts for the gocryptfs passphrase.
+#
+# Paths are resolved the same way the PAM module does it: the per-user config
+# file ~/.gocryptfs/config wins, otherwise the built-in defaults apply
+# (~/.gocryptfs/gocryptfs mounted at ~/Private). PAM arguments are not visible
+# here; if your PAM stack passes cipherdir=/mountpoint=, put the same values
+# into ~/.gocryptfs/config or use --cipherdir/--mountpoint.
+#
+# The mount is torn down like any other: at logout of the last session if
+# auto-umount is enabled, or manually with 'fusermount3 -u <mountpoint>'.
+
+set -euo pipefail
+
+PROG="${0##*/}"
+GOCRYPTFS_BIN="/usr/bin/gocryptfs"
+CONFIG_DIR_NAME=".gocryptfs"
+DEFAULT_MOUNT_DIR_NAME="Private"
+MAX_TRIES=3
+# gocryptfs exit code for a wrong passphrase
+EXIT_PASSWORD_INCORRECT=12
+
+CIPHER_ARG=""
+MOUNT_ARG=""
+
+die()  { echo "$PROG: error: $*" >&2; exit 1; }
+info() { echo "$PROG: $*"; }
+
+usage() {
+	cat <<EOF
+Usage: $PROG [options]
+
+Mount your gocryptfs-encrypted directory, prompting for the passphrase.
+Use this in sessions where pam_gocryptfs could not mount it at login
+(e.g. SSH public-key logins).
+
+Options:
+  --cipherdir DIR    directory holding the 'gocryptfs' cipher data
+                     (default: from ~/$CONFIG_DIR_NAME/config, else ~/$CONFIG_DIR_NAME)
+  --mountpoint DIR   where to mount
+                     (default: from ~/$CONFIG_DIR_NAME/config, else ~/$DEFAULT_MOUNT_DIR_NAME)
+  -h, --help         show this help
+EOF
+}
+
+# ---- argument parsing -------------------------------------------------------
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--cipherdir)  shift; [ $# -gt 0 ] || die "--cipherdir needs an argument"; CIPHER_ARG="$1" ;;
+		--mountpoint) shift; [ $# -gt 0 ] || die "--mountpoint needs an argument"; MOUNT_ARG="$1" ;;
+		-h|--help)    usage; exit 0 ;;
+		*)            die "unknown argument: $1 (try --help)" ;;
+	esac
+	shift
+done
+
+[ -x "$GOCRYPTFS_BIN" ] || die "$GOCRYPTFS_BIN not found"
+
+# ---- resolve the account ----------------------------------------------------
+
+# Use the passwd entry rather than $HOME, so %(HOME) means the same as in the
+# PAM module.
+PW_ENT="$(getent passwd "$(id -u)")" || die "cannot look up the current user"
+IFS=: read -r U_NAME _ U_UID U_GID _ U_HOME _ <<<"$PW_ENT"
+[ -n "$U_HOME" ] || die "user $U_NAME has no home directory"
+
+# Expand a leading ~/ and the %(USER), %(HOME), %(USERUID), %(USERGID)
+# variables, exactly like the module. Unknown variables are left untouched.
+expand_vars() {
+	local spec="$1"
+	case "$spec" in
+		"~/"*) spec="$U_HOME/${spec#"~/"}" ;;
+	esac
+	spec="${spec//"%(USER)"/$U_NAME}"
+	spec="${spec//"%(HOME)"/$U_HOME}"
+	spec="${spec//"%(USERUID)"/$U_UID}"
+	spec="${spec//"%(USERGID)"/$U_GID}"
+	printf '%s' "$spec"
+}
+
+# Mirror of the module's accident guard: forward '-flag' lines, but never a
+# foreground mount (-f/-fg), which would block this script forever.
+is_allowed_option() {
+	local name="${1#-}"
+	name="${name#-}"
+	name="${name%%=*}"
+	[ -n "$name" ] && [ "$name" != f ] && [ "$name" != fg ]
+}
+
+# ---- read the per-user config file ------------------------------------------
+
+CFG_CIPHERDIR=""
+CFG_MOUNTPOINT=""
+OPTIONS=()
+
+CONFIG_FILE="$U_HOME/$CONFIG_DIR_NAME/config"
+# Same rule as the module: only a regular file (not a symlink) owned by us.
+if [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] && [ "$(stat -c %u "$CONFIG_FILE")" = "$U_UID" ]; then
+	while IFS= read -r line || [ -n "$line" ]; do
+		# trim surrounding whitespace
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		case "$line" in
+			""|"#"*) ;;
+			-*) is_allowed_option "$line" && OPTIONS+=("$line") ;;
+			*=*)
+				key="${line%%=*}"; key="${key%"${key##*[![:space:]]}"}"
+				value="${line#*=}"; value="${value#"${value%%[![:space:]]*}"}"
+				case "$key" in
+					cipherdir)  CFG_CIPHERDIR="$value" ;;
+					mountpoint) CFG_MOUNTPOINT="$value" ;;
+				esac
+				;;
+		esac
+	done <"$CONFIG_FILE"
+fi
+
+# Precedence: command line > config file > built-in default.
+if [ -n "$CIPHER_ARG" ]; then
+	CONFIG_DIR="$CIPHER_ARG"
+elif [ -n "$CFG_CIPHERDIR" ]; then
+	CONFIG_DIR="$(expand_vars "$CFG_CIPHERDIR")"
+else
+	CONFIG_DIR="$U_HOME/$CONFIG_DIR_NAME"
+fi
+if [ -n "$MOUNT_ARG" ]; then
+	MOUNTPOINT="$MOUNT_ARG"
+elif [ -n "$CFG_MOUNTPOINT" ]; then
+	MOUNTPOINT="$(expand_vars "$CFG_MOUNTPOINT")"
+else
+	MOUNTPOINT="$U_HOME/$DEFAULT_MOUNT_DIR_NAME"
+fi
+CIPHER_DIR="$CONFIG_DIR/gocryptfs"
+
+# ---- mount ------------------------------------------------------------------
+
+is_mounted() {
+	findmnt -n -t fuse.gocryptfs,gocryptfs --mountpoint "$MOUNTPOINT" >/dev/null 2>&1
+}
+
+if is_mounted; then
+	info "$MOUNTPOINT is already mounted"
+	exit 0
+fi
+
+[ -f "$CIPHER_DIR/gocryptfs.conf" ] \
+	|| die "no gocryptfs.conf in $CIPHER_DIR — not initialized? (gocryptfs -init $CIPHER_DIR)"
+
+if [ ! -d "$MOUNTPOINT" ]; then
+	mkdir -m 0700 -p "$MOUNTPOINT" || die "cannot create mountpoint $MOUNTPOINT"
+fi
+
+tries=0
+while :; do
+	tries=$((tries + 1))
+	rc=0
+	"$GOCRYPTFS_BIN" -q "${OPTIONS[@]}" "$CIPHER_DIR" "$MOUNTPOINT" || rc=$?
+	[ "$rc" = 0 ] && break
+	if [ "$rc" = "$EXIT_PASSWORD_INCORRECT" ] && [ "$tries" -lt "$MAX_TRIES" ]; then
+		echo "Wrong passphrase, try again." >&2
+		continue
+	fi
+	die "mounting $CIPHER_DIR at $MOUNTPOINT failed (gocryptfs exit code $rc)"
+done
+
+info "mounted $MOUNTPOINT"
+
+# A shell whose working directory lies inside the mountpoint still sees the
+# directory underneath the mount (typical for whole-home encryption, where the
+# login shell starts in the empty home).
+case "$PWD/" in
+	"$MOUNTPOINT"/*) info "run 'cd \"$PWD\"' to see the decrypted contents" ;;
+esac

@@ -174,9 +174,16 @@ Important caveats for whole-home encryption:
 - **Password-less logins cannot decrypt the home.** SSH public-key logins,
   autologin, and similar never run the `auth` stack at all, so no passphrase
   reaches the module and the session opens onto an empty mount. This is
-  inherent to the approach (eCryptfs had the same limit).
+  inherent to the approach (eCryptfs had the same limit). Run
+  `gocryptfs-mount-private` in such a session to mount it by hand (see below).
 - **`-allow_other`** (and `user_allow_other` in `/etc/fuse.conf`) may be needed
   if a greeter or agent must read into the home from outside the user's session.
+
+## Mounting manually (SSH key logins)
+
+Password-less logins (SSH keys, autologin) cannot mount the filesystem. Run
+`gocryptfs-mount-private` in such a session to mount it by hand; it asks for the
+passphrase and uses the paths from `~/.gocryptfs/config` (or the defaults).
 
 ## Binary locations and permissions
 
